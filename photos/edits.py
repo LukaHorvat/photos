@@ -14,7 +14,7 @@ settings, it and the following ones take the new ones. Both come down to
 `edits[name] = settings`. An edit that changes nothing compared to what the photo
 would inherit is dropped, so moving a slider back merges a split again.
 
-web/editor.js has the same `resolve` for display. Keep them in sync.
+The editor gets the outcome from `runs` and doesn't repeat any of this.
 """
 
 from __future__ import annotations
@@ -44,15 +44,23 @@ def group_ids(metas: list[dict]) -> list[int]:
     return ids
 
 
+def runs(names: list[str], groups: list[int], edits: dict) -> tuple[list[int], list[dict]]:
+    """Consecutive photos sharing settings: a run starts at each series and at each edit.
+
+    Returns the run number of every photo, and the settings of every run.
+    """
+    ids, settings = [], []
+    for i, name in enumerate(names):
+        if i == 0 or groups[i] != groups[i - 1] or name in edits:
+            settings.append(edits.get(name, DEFAULTS))
+        ids.append(len(settings) - 1)
+    return ids, settings
+
+
 def resolve(names: list[str], groups: list[int], edits: dict) -> list[dict]:
     """The settings of every photo."""
-    out, current = [], DEFAULTS
-    for i, name in enumerate(names):
-        if i == 0 or groups[i] != groups[i - 1]:
-            current = DEFAULTS
-        current = edits.get(name, current)
-        out.append(current)
-    return out
+    ids, settings = runs(names, groups, edits)
+    return [settings[i] for i in ids]
 
 
 def normalize(names: list[str], groups: list[int], edits: dict) -> dict:

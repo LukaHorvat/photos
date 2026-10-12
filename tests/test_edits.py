@@ -1,5 +1,5 @@
-from photos.develop import DEFAULTS
-from photos.edits import apply, group_ids, resolve
+from photos.develop import DEFAULTS, clean
+from photos.edits import apply, group_ids, resolve, runs
 
 # Ten photos: a series of six (0-5), a single photo (6), a series of three (7-9).
 NAMES = [f"P{i}" for i in range(10)]
@@ -59,6 +59,19 @@ def test_reverting_a_split_merges_it_back():
 def test_changes_never_cross_into_the_next_group():
     e = edit({}, 4, compress=50)
     assert settings(e) == [0, 0, 0, 0, 50, 50, 0, 0, 0, 0]
+
+
+def test_runs_start_at_each_series_and_each_edit():
+    e = edit(edit({}, 0, compress=40), 3, compress=80)
+    ids, settings = runs(NAMES, GROUPS, e)
+    assert ids == [0, 0, 0, 1, 1, 1, 2, 3, 3, 3]
+    assert [s["compress"] for s in settings] == [40, 80, 0, 0]
+
+
+def test_temperatures_snap_to_the_grid_the_editor_has_multipliers_for():
+    assert clean({"temp": 5234})["temp"] == 5250
+    assert clean({"temp": 100})["temp"] == 2000
+    assert clean({"temp": None})["temp"] is None
 
 
 def test_unpicked_photos_are_grouped_like_picked_ones():

@@ -1,8 +1,9 @@
 'use strict';
 
-// WebGL version of develop.py's to_srgb, so edits preview instantly. The server sends
-// linear camera RGB and the base-layer coefficients once per photo; everything that
-// depends on the sliders happens here. Keep in sync with develop.py.
+// WebGL version of develop.py's to_srgb, so edits preview instantly. The server sends,
+// once per photo, linear camera RGB, the base-layer coefficients and the white balance
+// multipliers for every temperature; the per-pixel maths the sliders drive happens here.
+// Keep in sync with develop.py.
 
 const VERTEX_SHADER = `#version 300 es
 in vec2 pos;
@@ -51,28 +52,6 @@ void main() {
   rgb = lum + (rgb - lum) * saturation;
   color = vec4(oetf(toneCurve(rgb)), 1.0);
 }`;
-
-function planckXY(temp) {
-  // CIE xy of a black body (Kim et al. 2002), as develop.planck_xy.
-  const t = Math.min(Math.max(temp, 1667), 25000);
-  const x = t <= 4000
-    ? -0.2661239e9 / t ** 3 - 0.2343589e6 / t ** 2 + 0.8776956e3 / t + 0.179910
-    : -3.0258469e9 / t ** 3 + 2.1070379e6 / t ** 2 + 0.2226347e3 / t + 0.240390;
-  let y;
-  if (t <= 2222) y = -1.1063814 * x ** 3 - 1.34811020 * x ** 2 + 2.18555832 * x - 0.20219683;
-  else if (t <= 4000) y = -0.9549476 * x ** 3 - 1.37418593 * x ** 2 + 2.09137015 * x - 0.16748867;
-  else y = 3.0817580 * x ** 3 - 5.87338670 * x ** 2 + 3.75112997 * x - 0.37001483;
-  return [x, y];
-}
-
-function wbMultipliers(info, temp) {
-  // As develop.Color.multipliers.
-  if (temp == null) return info.asShot;
-  const [x, y] = planckXY(temp);
-  const xyz = [x / y, 1, (1 - x - y) / y];
-  const mul = info.camXyz.map((row) => 1 / (row[0] * xyz[0] + row[1] * xyz[1] + row[2] * xyz[2]));
-  return mul.map((m, i) => (m / mul[1]) * info.tint[i]);
-}
 
 function parsePreview(buffer) {
   // Layout written by develop.preview.
@@ -149,7 +128,8 @@ class Developer {
     const p = this.pipeline;
     const info = this.info;
     if (!info) return;
-    const mul = wbMultipliers(info, settings.temp);
+    // The server sends the multipliers for every temperature on the slider's grid.
+    const mul = settings.temp == null ? info.asShot : info.wb[settings.temp];
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.uniform3fv(this.loc.mul, mul);
     gl.uniform1f(this.loc.clipLevel, Math.min(...mul));

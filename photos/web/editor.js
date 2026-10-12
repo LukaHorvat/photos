@@ -1,19 +1,21 @@
 'use strict';
 
 // The editor: develops the kept photos with the WebGL renderer in develop.js.
-// How settings spread through a series is decided by the server (edits.py); `resolveAll`
-// here is its edits.resolve, for display. Keep the two in sync.
+// How settings spread through a series is decided by the server (edits.py), which
+// sends the outcome as runs: consecutive photos sharing settings.
 
 const ED = {
   loaded: false,
   groups: [], // series number of every photo, parallel to S.photos
-  taken: [], // capture time of every photo, 'YYYY:MM:DD HH:MM:SS' 
-  edits: {}, // name -> settings, on the photo where a run of settings starts
+  taken: [], // capture time of every photo, 'YYYY:MM:DD HH:MM:SS'
+  runs: [], // run number of every photo; a run shares settings
+  runSettings: [], // settings of every run
+  runEdited: [], // whether a run's settings differ from the defaults
   raw: [], // whether each photo is a raw file
   defaults: null,
   limits: null,
+  tempStep: null,
   pipeline: null,
-  settings: new Map(), // name -> settings it gets
   kept: [], // kept raw photos, in shooting order
   pos: -1,
   live: null, // the current photo's settings, including a drag not saved yet
@@ -34,33 +36,25 @@ const editCurrent = () => ED.kept[ED.pos] ?? null;
 
 // --- Series ---------------------------------------------------------------------------
 
-function resolveAll() {
-  ED.settings.clear();
-  let current = ED.defaults;
-  S.photos.forEach((name, i) => {
-    if (i === 0 || ED.groups[i] !== ED.groups[i - 1]) current = ED.defaults;
-    if (ED.edits[name]) current = ED.edits[name];
-    ED.settings.set(name, current);
-  });
-}
+const settingsOf = (i) => ED.runSettings[ED.runs[i]];
 
-function seriesOf(i) {
-  // [first, last] photo index of the series photo i is in.
+function sameRange(ids, i) {
+  // [first, last] index of the consecutive photos with the same id as photo i.
   let a = i;
   let b = i;
-  while (a > 0 && ED.groups[a - 1] === ED.groups[i]) a--;
-  while (b + 1 < S.photos.length && ED.groups[b + 1] === ED.groups[i]) b++;
+  while (a > 0 && ids[a - 1] === ids[i]) a--;
+  while (b + 1 < ids.length && ids[b + 1] === ids[i]) b++;
   return [a, b];
 }
 
-function runOf(i) {
-  // [first, last] index of the photos sharing photo i's settings: a change at the first
-  // of them would reach all of them.
-  let a = i;
-  let b = i;
-  while (a > 0 && ED.groups[a - 1] === ED.groups[i] && !ED.edits[S.photos[a]]) a--;
-  while (b + 1 < S.photos.length && ED.groups[b + 1] === ED.groups[i] && !ED.edits[S.photos[b + 1]]) b++;
-  return [a, b];
+const seriesOf = (i) => sameRange(ED.groups, i);
+// The photos sharing photo i's settings: a change at the first of them reaches all of them.
+const runOf = (i) => sameRange(ED.runs, i);
+
+function applyRuns(st) {
+  ED.runs = st.runs;
+  ED.runSettings = st.runSettings;
+  ED.runEdited = st.runEdited;
 }
 
 function keptBetween(a, b) {
@@ -69,15 +63,22 @@ function keptBetween(a, b) {
   return n;
 }
 
-const isDefault = (s) => Object.keys(ED.defaults).every((k) => s[k] === ED.defaults[k]);
-
 // --- Sliders -------------------------------------------------------------------------------
 
-const [TEMP_MIN, TEMP_MAX] = [2000, 15000];
+// The temperature slider is linear in mired (1e6 / K), which is closer to how different
+// temperatures look, and lands on the server's grid of temperatures.
 const miredOf = (t) => 1e6 / t;
-// The temperature slider is linear in mired, which is closer to how different temperatures look.
-const tempToSlider = (t) => Math.round(((miredOf(TEMP_MIN) - miredOf(t)) / (miredOf(TEMP_MIN) - miredOf(TEMP_MAX))) * 1000);
-const sliderToTemp = (v) => Math.round(1e6 / (miredOf(TEMP_MIN) - (v / 1000) * (miredOf(TEMP_MIN) - miredOf(TEMP_MAX))) / 50) * 50;
+
+function tempToSlider(t) {
+  const [lo, hi] = ED.limits.temp;
+  return Math.round(((miredOf(lo) - miredOf(t)) / (miredOf(lo) - miredOf(hi))) * 1000);
+}
+
+function sliderToTemp(v) {
+  const [lo, hi] = ED.limits.temp;
+  const t = 1e6 / (miredOf(lo) - (v / 1000) * (miredOf(lo) - miredOf(hi)));
+  return Math.min(hi, Math.max(lo, Math.round(t / ED.tempStep) * ED.tempStep));
+}
 
 function asShotTemp() {
   return ED.dev && ED.shown === editCurrent() ? ED.dev.info.asShotTemp : null;
@@ -154,8 +155,7 @@ function commit() {
     }))
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
     .then((res) => {
-      ED.edits = res.edits;
-      resolveAll();
+      applyRuns(res);
       buildEditStrip();
       updateSeries();
     })
@@ -235,7 +235,7 @@ function showEdit() {
     layoutEdit();
     return;
   }
-  ED.live = { ...ED.settings.get(name) };
+  ED.live = { ...settingsOf(S.order.get(name)) };
   updateSliders();
   updateSeries();
   if (ED.shown !== name) {
@@ -327,7 +327,7 @@ function buildEditStrip() {
       const j = S.order.get(ED.kept[pos - 1]);
       const sep = document.createElement('div');
       if (ED.groups[i] !== ED.groups[j]) sep.className = 'gap';
-      else if (runOf(i)[0] > j) sep.className = 'split';
+      else if (ED.runs[i] !== ED.runs[j]) sep.className = 'split';
       if (sep.className) frag.append(sep);
     }
     const cell = document.createElement('div');
@@ -358,7 +358,7 @@ function updateStripMarks() {
     const k = S.order.get(n);
     cell.classList.toggle('cur', pos === ED.pos);
     cell.classList.toggle('affected', k >= i && k <= rb);
-    cell.classList.toggle('edited', !isDefault(ED.settings.get(n)));
+    cell.classList.toggle('edited', ED.runEdited[ED.runs[k]]);
   });
   const cur = ED.cells[ED.pos];
   if (cur && S.mode === 'edit') cur.scrollIntoView({ inline: 'center', block: 'nearest' });
@@ -398,8 +398,19 @@ async function editorEnter(name) {
   if (!ED.loaded) {
     const st = await (await fetch('/api/edits')).json();
     Object.assign(ED, {
-      groups: st.groups, taken: st.taken, edits: st.edits, raw: st.raw, defaults: st.defaults, limits: st.limits, pipeline: st.pipeline,
+      groups: st.groups,
+      taken: st.taken,
+      raw: st.raw,
+      defaults: st.defaults,
+      limits: st.limits,
+      tempStep: st.tempStep,
+      pipeline: st.pipeline,
     });
+    applyRuns(st);
+    for (const el of SLIDERS) {
+      const input = el.querySelector('input');
+      if (el.dataset.key !== 'temp') [input.min, input.max] = ED.limits[el.dataset.key];
+    }
     ED.loaded = true;
     try {
       ED.dev = new Developer(editCanvas, ED.pipeline);
@@ -407,7 +418,6 @@ async function editorEnter(name) {
       toast(`Can't develop in this browser: ${err.message}`, true);
     }
   }
-  resolveAll();
   ED.kept = S.photos.filter((n, i) => S.marks[n] === 'keep' && ED.raw[i]);
   // Open on the photo picked last, or the nearest kept one after it.
   const at = S.order.get(name) ?? 0;

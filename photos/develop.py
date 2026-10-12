@@ -25,6 +25,7 @@ from PIL import Image
 
 DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "saturation": 0}
 LIMITS = {"compress": (0, 100), "exposure": (-4.0, 4.0), "temp": (2000, 15000), "saturation": (-100, 100)}
+TEMP_STEP = 50  # Kelvin; temperatures are kept on this grid, so the editor can be sent all of them
 
 # Base tone curve y = (1 + K) t^C / (t^C + K), t = GAIN * x, clipped to 1. Fitted by
 # histogram matching against D3500 JPEGs (scripts/calibrate_curve.py).
@@ -127,12 +128,13 @@ class Color:
         return temp_multipliers(self.cam_xyz, temp) * self.tint
 
     def header(self) -> dict:
+        lo, hi = LIMITS["temp"]
         return {
-            "camXyz": self.cam_xyz.tolist(),
             "rgbCam": self.rgb_cam.tolist(),
             "asShot": self.as_shot.tolist(),
-            "tint": self.tint.tolist(),
             "asShotTemp": round(self.as_shot_temp),
+            # The multipliers for every temperature the editor can set, so it needn't compute them.
+            "wb": {t: self.multipliers(t).tolist() for t in range(lo, hi + 1, TEMP_STEP)},
         }
 
 
@@ -147,7 +149,12 @@ def clean(settings: dict | None) -> dict:
             continue
         lo, hi = LIMITS[key]
         value = min(max(float(value), lo), hi)
-        out[key] = round(value, 2) if key == "exposure" else int(round(value))
+        if key == "exposure":
+            out[key] = round(value, 2)
+        elif key == "temp":
+            out[key] = int(round(value / TEMP_STEP) * TEMP_STEP)
+        else:
+            out[key] = int(round(value))
     return out
 
 

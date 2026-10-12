@@ -152,10 +152,15 @@ class Library:
         with self._save_lock:
             self.state["edits"] = edits.apply(self.names, self.groups(), self.state["edits"], name, settings)
             self._save()
-            return self.state["edits"]
+            return self.runs()
 
     def settings(self) -> dict[str, dict]:
         return dict(zip(self.names, edits.resolve(self.names, self.groups(), self.state["edits"])))
+
+    def runs(self) -> dict:
+        """What the editor shows: which photos share settings, and those settings."""
+        ids, settings = edits.runs(self.names, self.groups(), self.state["edits"])
+        return {"runs": ids, "runSettings": settings, "runEdited": [s != develop.DEFAULTS for s in settings]}
 
     def prewarm(self, workers: int = 8):
         """Parse headers and build thumbnails in the background so the grid fills instantly."""
@@ -251,10 +256,11 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "groups": self.lib.groups(),
                     "taken": self.lib._taken,
-                    "edits": self.lib.state["edits"],
+                    **self.lib.runs(),
                     "raw": [p.is_raw for p in self.lib.photos.values()],
                     "defaults": develop.DEFAULTS,
                     "limits": develop.LIMITS,
+                    "tempStep": develop.TEMP_STEP,
                     "pipeline": {
                         "curveGain": develop.CURVE_GAIN,
                         "curveC": develop.CURVE_C,
@@ -309,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
             name = body.get("name")
             if name not in photos:
                 return self.send_error(HTTPStatus.BAD_REQUEST)
-            return self._json({"edits": self.lib.set_edit(name, body.get("settings") or {})})
+            return self._json(self.lib.set_edit(name, body.get("settings") or {}))
         if self.path == "/api/export":
             return self._json(self.lib.export.start())
         if self.path != "/api/mark":
