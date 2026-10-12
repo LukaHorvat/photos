@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image, ImageCms
 
 from . import develop
-from .raw import Photo
+from .raw import Photo, read_file
 
 QUALITY = 92
 
@@ -25,7 +25,7 @@ def export_photo(photo: Photo, settings: dict, out_dir: Path) -> Path:
         out = out_dir / photo.path.name
         shutil.copyfile(photo.path, out)
         return out
-    im = Image.fromarray(develop.develop(photo.path.read_bytes(), settings))
+    im = Image.fromarray(develop.develop(read_file(photo.path), settings))
     exif = Image.Exif()
     tags = photo.info.tags
     for tag, value in tags.get("ifd0", {}).items():

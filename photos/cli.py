@@ -1,10 +1,16 @@
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 
 def main():
+    # LibRaw demosaics with OpenMP, by default with a thread per core that spins while
+    # it waits. Exports decode several photos at once, and two threads each, sleeping
+    # when idle, gets the most photos through (it's read once, when LibRaw loads).
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
     ap = argparse.ArgumentParser(prog="photos")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, help in [("cull", "pick which photos to keep"), ("edit", "develop the kept photos")]:

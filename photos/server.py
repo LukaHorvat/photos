@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import develop, edits
 from .export import export_photo
-from .raw import IMAGE_EXTS, RAW_EXTS, Photo
+from .raw import IMAGE_EXTS, RAW_EXTS, Photo, read_file
 
 WEB = Path(__file__).parent / "web"
 STATE_FILE = ".photos.json"
@@ -107,7 +107,7 @@ class Library:
         self.names = list(self.photos)
         self.clips = Prefetcher(lambda name: self.photos[name].clipping_mask(), workers=6, keep=10**6)
         self.previews = Prefetcher(
-            lambda key: develop.preview(self.photos[key[0]].path.read_bytes(), key[1]), workers=4, keep=12
+            lambda key: develop.preview(read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
         self.state_path = folder / STATE_FILE
         self.state = self._load()
@@ -195,7 +195,7 @@ class Export:
         with self.lock:
             return {**self.status, "failed": list(self.status["failed"])}
 
-    def start(self, workers: int = 3) -> dict:
+    def start(self, workers: int = 6) -> dict:
         with self.lock:
             if self.status["running"]:
                 return self.snapshot()

@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -218,6 +219,24 @@ def _exif_summary(ifd0: dict, exif: dict) -> dict:
     return out
 
 
+def read_file(path: Path, parts: int = 8, min_part: int = 2 << 20) -> bytes:
+    """A whole file. Big ones are read as parallel ranges: over WSL's /mnt each request
+    waits on a round trip to Windows, and overlapping them makes reading ~3x faster."""
+    size = path.stat().st_size
+    n = max(1, min(parts, size // min_part))
+    if n == 1:
+        return path.read_bytes()
+    step = -(-size // n)
+
+    def chunk(i: int) -> bytes:
+        with open(path, "rb") as f:
+            f.seek(i * step)
+            return f.read(step)
+
+    with ThreadPoolExecutor(n) as ex:
+        return b"".join(ex.map(chunk, range(n)))
+
+
 def orientation_app1(orientation: int) -> bytes:
     """A minimal EXIF APP1 segment carrying only an Orientation tag.
 
@@ -265,7 +284,7 @@ class Photo:
         min_side=0 means the largest available.
         """
         if not self.is_raw:
-            return [self.path.read_bytes()]
+            return [read_file(self.path)]
         info = self.info
         if not info.jpegs:
             return [self._render()]
@@ -314,7 +333,7 @@ class Photo:
             import numpy as np
             import rawpy
 
-            with rawpy.imread(io.BytesIO(self.path.read_bytes())) as raw:
+            with rawpy.imread(io.BytesIO(read_file(self.path))) as raw:
                 img = raw.raw_image_visible
                 img = img[: img.shape[0] // 2 * 2, : img.shape[1] // 2 * 2]
                 # Lossy-compressed NEFs saturate a few codes below LibRaw's nominal white
@@ -387,7 +406,7 @@ class Photo:
             if self.is_raw:
                 src = b"".join(self.jpeg(THUMB_SIZE)) if info.jpegs else self._render()
             else:
-                src = self.path.read_bytes()
+                src = read_file(self.path)
             im = Image.open(io.BytesIO(src))
             im.draft("RGB", (THUMB_SIZE, THUMB_SIZE))
             orientation = im.getexif().get(0x0112, 1)

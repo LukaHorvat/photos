@@ -191,9 +191,14 @@ def base_coefficients(rgb_cam: np.ndarray, color: Color) -> np.ndarray:
     h, w = rgb_cam.shape[:2]
     scale = BASE_LONG_SIDE / max(h, w)
     lh, lw = max(1, round(h * scale)), max(1, round(w * scale))
-    lin = np.minimum(rgb_cam * color.as_shot.astype(np.float32), color.as_shot.min()) @ color.rgb_cam.T.astype(np.float32)
-    lum = np.log2(np.maximum(lin @ LUMA, LOG_FLOOR)).astype(np.float32)
-    guide = np.asarray(Image.fromarray(lum).resize((lw, lh), Image.Resampling.BOX))
+    # Linear luminance at the as-shot white balance (one weighted sum per pixel), averaged
+    # down to the base layer's size, then logged. Averaging linear light gives the same
+    # result whatever size it starts from, so the editor's preview and an export agree.
+    mul = color.as_shot.astype(np.float32)
+    weights = (color.rgb_cam.T @ LUMA).astype(np.float32)
+    lum = np.minimum(rgb_cam * mul, mul.min()) @ weights
+    small = np.asarray(Image.fromarray(lum).resize((lw, lh), Image.Resampling.BOX))
+    guide = np.log2(np.maximum(small, LOG_FLOOR)).astype(np.float32)
     r, eps = BASE_RADIUS, BASE_EPS
     mean = _box(guide, r)
     var = _box(guide * guide, r) - mean * mean
