@@ -113,6 +113,7 @@ class Library:
         self.state = self._load()
         self._save_lock = threading.Lock()
         self._groups: list[int] | None = None
+        self._taken: list[str | None] = []
         self.export = Export(self)
 
     def _load(self) -> dict:
@@ -143,6 +144,7 @@ class Library:
         if self._groups is None:
             with ThreadPoolExecutor(8) as ex:
                 metas = list(ex.map(lambda p: p.meta(), self.photos.values()))
+            self._taken = [m.get("taken") for m in metas]
             self._groups = edits.group_ids(metas)
         return self._groups
 
@@ -248,6 +250,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(
                 {
                     "groups": self.lib.groups(),
+                    "taken": self.lib._taken,
                     "edits": self.lib.state["edits"],
                     "raw": [p.is_raw for p in self.lib.photos.values()],
                     "defaults": develop.DEFAULTS,

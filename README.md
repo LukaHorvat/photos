@@ -27,12 +27,12 @@ prepares once per photo, so sliders respond instantly; exports run the same
 pipeline in numpy (`develop.py`) at full resolution. The default rendering's
 tone curve is fitted to the camera's own JPEGs (`scripts/calibrate_curve.py`).
 
-Photos are grouped into series: runs of consecutive shots with identical shutter
-speed, aperture, ISO, exposure compensation and focal length (`edits.series_key`).
-A change applies to the photo and the following ones of its series; changing a
-photo that isn't the first of its series splits the series just before it. Series
-are worked out over all photos, picked or not, so picking a photo later puts it in
-its series with that series' settings.
+Photos are grouped into series: a pause of more than 10 seconds between two
+consecutive shots starts a new one (`edits.SERIES_GAP`). A change applies to the
+photo and the following ones of its series; changing a photo that isn't the first
+of its series splits the series just before it. Series are worked out over all
+photos, picked or not, so picking a photo later puts it in its series with that
+series' settings.
 
 ## State
 

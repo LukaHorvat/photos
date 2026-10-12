@@ -3,7 +3,8 @@ from photos.edits import apply, group_ids, resolve
 
 # Ten photos: a series of six (0-5), a single photo (6), a series of three (7-9).
 NAMES = [f"P{i}" for i in range(10)]
-META = [{"shutter": "1/125"}] * 6 + [{"shutter": "1/60"}] + [{"shutter": "1/250"}] * 3
+SECONDS = [0, 2, 4, 10, 18, 28, 60, 100, 101, 111]
+META = [{"taken": f"2026:06:30 12:{s // 60:02d}:{s % 60:02d}"} for s in SECONDS]
 GROUPS = group_ids(META)
 
 
@@ -16,9 +17,13 @@ def edit(edits, i, **change):
     return apply(NAMES, GROUPS, edits, NAMES[i], {**current, **change})
 
 
-def test_groups_are_runs_of_identical_settings():
-    assert GROUPS == [0, 0, 0, 0, 0, 0, 1, 2, 2, 2]
-    assert group_ids([{"iso": 100}, {"iso": 200}, {"iso": 100}]) == [0, 1, 2]
+def test_a_pause_of_more_than_ten_seconds_starts_a_series():
+    assert GROUPS == [0, 0, 0, 0, 0, 0, 1, 2, 2, 2]  # gaps of exactly 10 s stay together
+
+
+def test_photos_without_capture_time_stand_alone():
+    t = {"taken": "2026:06:30 12:00:00"}
+    assert group_ids([t, {}, t, {"taken": "garbage"}, t]) == [0, 1, 2, 3, 4]
 
 
 def test_editing_first_photo_changes_whole_group_only():

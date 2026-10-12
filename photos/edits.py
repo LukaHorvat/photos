@@ -1,8 +1,9 @@
 """Which settings each photo gets: series detection and edit propagation.
 
-Photos are grouped into runs of identical shooting settings, in shooting order and
-over *all* photos, kept or not, so picking or un-picking a photo never changes the
-groups. An edit is stored on the photo where it starts:
+Photos are grouped into series: bursts of shots with no pause longer than
+SERIES_GAP between them, in shooting order and over *all* photos, kept or not, so
+picking or un-picking a photo never changes the groups. An edit is stored on the
+photo where it starts:
 
     edits = {"DSC_0012.NEF": {"compress": 40, ...}}
 
@@ -18,21 +19,28 @@ web/editor.js has the same `resolve` for display. Keep them in sync.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from .develop import DEFAULTS, clean
 
+SERIES_GAP = 10  # seconds; a longer pause between two shots starts a new series
 
-def series_key(meta: dict):
-    """Shooting settings that must match for consecutive photos to be one series."""
-    return (meta.get("shutter"), meta.get("aperture"), meta.get("iso"), meta.get("ev"), meta.get("focal"))
+
+def taken(meta: dict) -> datetime | None:
+    try:
+        return datetime.strptime(meta["taken"], "%Y:%m:%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def group_ids(metas: list[dict]) -> list[int]:
-    """Group number for each photo (in shooting order); a new group starts where settings change."""
-    ids, prev = [], object()
+    """Series number for each photo, in shooting order. A photo without a capture time is a series of its own."""
+    ids, prev = [], None
     for meta in metas:
-        key = series_key(meta)
-        ids.append(ids[-1] + (key != prev) if ids else 0)
-        prev = key
+        t = taken(meta)
+        same = t is not None and prev is not None and abs((t - prev).total_seconds()) <= SERIES_GAP
+        ids.append(ids[-1] + (not same) if ids else 0)
+        prev = t
     return ids
 
 

@@ -7,6 +7,7 @@
 const ED = {
   loaded: false,
   groups: [], // series number of every photo, parallel to S.photos
+  taken: [], // capture time of every photo, 'YYYY:MM:DD HH:MM:SS' 
   edits: {}, // name -> settings, on the photo where a run of settings starts
   raw: [], // whether each photo is a raw file
   defaults: null,
@@ -297,9 +298,8 @@ function updateSeries() {
   const i = S.order.get(name);
   const [a, b] = seriesOf(i);
   const [ra, rb] = runOf(i);
-  const m = metas.get(name) || meta(name) || {};
-  const shot = [m.shutter, m.aperture, m.iso && `ISO ${m.iso}`, m.ev].filter(Boolean).join(' · ');
-  title.textContent = b > a ? `Series of ${b - a + 1}${shot ? ` · ${shot}` : ''}` : `Single photo${shot ? ` · ${shot}` : ''}`;
+  const clock = (k) => ED.taken[k]?.slice(11) ?? '?';
+  title.textContent = b > a ? `Series of ${b - a + 1} · ${clock(a)} – ${clock(b)}` : `Single photo · ${clock(i)}`;
   const lines = [];
   if (b > a) lines.push(`${keptBetween(a, b)} of the ${b - a + 1} are kept.`);
   const following = keptBetween(i + 1, rb);
@@ -310,7 +310,10 @@ function updateSeries() {
         (reach > following ? ` (${reach} following in all, counting unpicked ones).` : '.')
       : 'A change applies to this photo only.',
   );
-  if (i > ra) lines.push(`It splits the series before this photo; the ${i - a} earlier photo${i - a === 1 ? '' : 's'} keep their settings.`);
+  if (i > ra) {
+    const earlier = i - a === 1 ? 'the earlier photo keeps its settings' : `the ${i - a} earlier photos keep their settings`;
+    lines.push(`It splits the series before this photo; ${earlier}.`);
+  }
   else if (i > a) lines.push('This photo already starts its own part of the series.');
   info.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
 }
@@ -395,7 +398,7 @@ async function editorEnter(name) {
   if (!ED.loaded) {
     const st = await (await fetch('/api/edits')).json();
     Object.assign(ED, {
-      groups: st.groups, edits: st.edits, raw: st.raw, defaults: st.defaults, limits: st.limits, pipeline: st.pipeline,
+      groups: st.groups, taken: st.taken, edits: st.edits, raw: st.raw, defaults: st.defaults, limits: st.limits, pipeline: st.pipeline,
     });
     ED.loaded = true;
     try {
