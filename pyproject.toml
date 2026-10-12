@@ -1,0 +1,21 @@
+[project]
+name = "photos"
+version = "0.1.0"
+description = "Personal raw photo workflow: cull, then edit."
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=10",
+    "rawpy>=0.21",
+]
+
+[project.scripts]
+photos = "photos.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

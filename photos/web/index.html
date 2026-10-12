@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photos</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <nav id="modes">
+    <button data-mode="cull" title="Pick photos (E)">Cull</button>
+    <button data-mode="edit" title="Develop the kept photos (E)">Edit</button>
+  </nav>
+  <span id="name"></span>
+  <span id="badge" class="badge cull-only" hidden></span>
+  <span id="pos"></span>
+  <span id="exif"></span>
+  <span class="spacer"></span>
+  <span id="counts" class="cull-only"></span>
+  <button id="zoomchip" class="chip on cull-only" hidden>100%</button>
+  <button id="clipchip" class="chip on clip cull-only" hidden>raw clipping</button>
+  <button id="filter" class="chip cull-only"></button>
+  <button id="auto" class="chip cull-only">auto-advance</button>
+  <span id="exportStatus" class="edit-only"></span>
+  <button id="exportBtn" class="chip edit-only" title="Develop every kept photo at full size into the export folder">Export kept</button>
+  <button id="helpchip" class="chip">? keys</button>
+</header>
+<main>
+  <div class="cull-only">
+    <div id="stage"></div>
+    <div id="cliplayer"></div>
+    <div id="frame"></div>
+    <div id="empty" hidden>No photos in this filter. Press <kbd>F</kbd> to change it.</div>
+    <div id="grid" hidden></div>
+  </div>
+  <section id="editor" class="edit-only">
+    <div id="editview">
+      <img id="editplaceholder" alt="" hidden>
+      <canvas id="editcanvas" hidden></canvas>
+      <div id="editnote"></div>
+      <div id="editempty" hidden>No kept raw photos yet. Press <kbd>E</kbd> to go back and pick some.</div>
+    </div>
+    <aside id="panel">
+      <div id="series">
+        <div id="seriestitle"></div>
+        <div id="seriesinfo"></div>
+      </div>
+      <div class="sliders">
+        <label class="slider" data-key="compress">
+          <span class="sname">Dynamic range compression</span><span class="sval"></span>
+          <input type="range" min="0" max="100" step="1">
+        </label>
+        <label class="slider" data-key="exposure">
+          <span class="sname">Exposure</span><span class="sval"></span>
+          <input type="range" min="-4" max="4" step="0.05">
+        </label>
+        <label class="slider" data-key="temp">
+          <span class="sname">Temperature</span><span class="sval"></span>
+          <input type="range" min="0" max="1000" step="1">
+        </label>
+        <label class="slider" data-key="saturation">
+          <span class="sname">Saturation</span><span class="sval"></span>
+          <input type="range" min="-100" max="100" step="1">
+        </label>
+      </div>
+      <p class="hint">Double-click a slider to reset it. <kbd>\</kbd> shows the photo without edits.</p>
+      <button id="resetPhoto" class="chip">Reset this photo</button>
+    </aside>
+    <div id="editstrip"></div>
+  </section>
+</main>
+<footer id="strip" class="cull-only"></footer>
+
+<div id="help" hidden>
+  <div class="panel">
+    <h2>Keys</h2>
+    <table class="cull-only">
+      <tr><td><kbd>←</kbd> <kbd>→</kbd> <kbd>Space</kbd></td><td>previous / next</td></tr>
+      <tr><td><kbd>↑</kbd> or <kbd>P</kbd></td><td>keep</td></tr>
+      <tr><td><kbd>↓</kbd> or <kbd>X</kbd></td><td>reject</td></tr>
+      <tr><td><kbd>U</kbd></td><td>clear mark</td></tr>
+      <tr><td><kbd>Z</kbd> or click</td><td>zoom to 100% at the cursor; drag to pan. Zoom stays on while you browse, to compare focus</td></tr>
+      <tr><td><kbd>J</kbd></td><td>raw clipping in magenta: a sensor channel saturated, or all four photosites at black level. The whole raw has to be decoded, so on a photo it hasn't prepared yet it takes up to a second; the next few are prepared in the background while you look</td></tr>
+      <tr><td><kbd>G</kbd></td><td>grid (<kbd>Enter</kbd> or double-click to open a photo, <kbd>↑</kbd> <kbd>↓</kbd> move rows)</td></tr>
+      <tr><td><kbd>F</kbd> / <kbd>Shift F</kbd></td><td>filter: all → unmarked → keepers → rejects</td></tr>
+      <tr><td><kbd>A</kbd></td><td>auto-advance after marking</td></tr>
+      <tr><td><kbd>S</kbd></td><td>show / hide filmstrip</td></tr>
+      <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first / last</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>leave zoom or grid</td></tr>
+      <tr><td><kbd>E</kbd></td><td>edit the kept photos</td></tr>
+    </table>
+    <table class="edit-only">
+      <tr><td><kbd>←</kbd> <kbd>→</kbd> <kbd>Space</kbd></td><td>previous / next kept photo</td></tr>
+      <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first / last</td></tr>
+      <tr><td><kbd>\</kbd></td><td>before / after: the photo without edits</td></tr>
+      <tr><td>double-click a slider</td><td>reset it</td></tr>
+      <tr><td><kbd>E</kbd></td><td>back to picking (rejected and unmarked photos are there)</td></tr>
+    </table>
+    <p class="edit-only">Photos are grouped into series: runs of shots with identical shutter speed, aperture, ISO,
+      exposure compensation and focal length. A change applies to the photo and the following ones of its series. Changing a photo
+      that isn't the first of its series splits the series just before it. Series are worked out over all photos,
+      picked or not, so a photo you pick later lands in its series with that series' settings.</p>
+    <p id="folder"></p>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+<script src="/static/develop.js"></script>
+<script src="/static/editor.js"></script>
+</body>
+</html>
