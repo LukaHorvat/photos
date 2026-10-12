@@ -15,7 +15,6 @@ const ED = {
   defaults: null,
   limits: null,
   tempStep: null,
-  pipeline: null,
   kept: [], // kept raw photos, in shooting order
   pos: -1,
   live: null, // the current photo's settings, including a drag not saved yet
@@ -404,7 +403,6 @@ async function editorEnter(name) {
       defaults: st.defaults,
       limits: st.limits,
       tempStep: st.tempStep,
-      pipeline: st.pipeline,
     });
     applyRuns(st);
     for (const el of SLIDERS) {
@@ -413,7 +411,7 @@ async function editorEnter(name) {
     }
     ED.loaded = true;
     try {
-      ED.dev = new Developer(editCanvas, ED.pipeline);
+      ED.dev = new Developer(editCanvas, await loadShaders());
     } catch (err) {
       toast(`Can't develop in this browser: ${err.message}`, true);
     }

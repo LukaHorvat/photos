@@ -21,6 +21,10 @@ from photos.raw import Photo
 Q = np.linspace(0.03, 0.97, 48)
 
 
+def oetf(x):
+    return np.where(x <= 0.0031308, 12.92 * x, 1.055 * np.power(np.maximum(x, 0.0031308), 1 / 2.4) - 0.055)
+
+
 def samples(path: Path):
     p = Photo(path)
     rgb, color = develop.decode(path.read_bytes(), half_size=True)
@@ -37,13 +41,14 @@ def main(folder: str):
     with ThreadPoolExecutor(8) as ex:
         pairs = list(ex.map(samples, files))
     x = np.concatenate([p[0] for p in pairs])
-    y = develop.oetf(np.concatenate([p[1] for p in pairs]))
+    y = oetf(np.concatenate([p[1] for p in pairs]))
     keep = (y > 0.02) & (y < 0.98)  # clipped tails carry no shape information
     x, y = x[keep], y[keep]
 
     def err(g, c, k):
+        # The tone curve of web/develop.frag.
         t = (x * g) ** c
-        return np.mean((develop.oetf(np.minimum((1 + k) * t / (t + k), 1)) - y) ** 2)
+        return np.mean((oetf(np.minimum((1 + k) * t / (t + k), 1)) - y) ** 2)
 
     best = min(
         (err(g, c, k), g, c, k)

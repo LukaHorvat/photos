@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Personal raw photo workflow: cull, then edit."
 requires-python = ">=3.10"
 dependencies = [
+    "moderngl>=5.13.0",
     "pillow>=10",
     "rawpy>=0.21",
 ]

@@ -1,8 +1,9 @@
-"""Raw development: the processing behind the editor and the exporter.
+"""Raw development: the inputs of the develop shader, and running it for exports.
 
-The editor previews with a WebGL shader (web/develop.js) that mirrors `render`
-below step for step, so sliders respond instantly; exports run the same maths
-here at full resolution. Keep the two in sync.
+The pipeline itself is web/develop.frag. It runs in the browser for the editor's
+preview, so sliders respond instantly, and on the server (gpu.py) for exports, so an
+export is what the editor showed. This module decodes raws into linear camera RGB and
+works out everything else the shader needs.
 
 The pipeline, in order:
   1. white balance: colour temperature (Kelvin) -> camera RGB multipliers
@@ -130,7 +131,6 @@ class Color:
     def header(self) -> dict:
         lo, hi = LIMITS["temp"]
         return {
-            "rgbCam": self.rgb_cam.tolist(),
             "asShot": self.as_shot.tolist(),
             "asShotTemp": round(self.as_shot_temp),
             # The multipliers for every temperature the editor can set, so it needn't compute them.
@@ -158,45 +158,27 @@ def clean(settings: dict | None) -> dict:
     return out
 
 
-def to_srgb(rgb: np.ndarray, color: Color, coeffs: np.ndarray, settings: dict) -> np.ndarray:
-    """camera RGB (HxWx3 float32, linear, saturation = 1) -> sRGB uint8. Modifies rgb."""
+def base_uniforms(color: Color) -> dict:
+    """The shader inputs that are fixed for a photo (see develop.frag)."""
+    return {
+        "rgbCam": color.rgb_cam.T.flatten().tolist(),  # GL matrices are column-major
+        "maxCompression": MAX_COMPRESSION,
+        "anchor": ANCHOR,
+        "logFloor": LOG_FLOOR,
+        "curve": [CURVE_GAIN, CURVE_C, CURVE_K],
+    }
+
+
+def uniforms(color: Color, settings: dict) -> dict:
+    """All shader inputs for these settings. web/develop.js sets the same ones."""
     s = clean(settings)
-    mul = color.multipliers(s["temp"]).astype(np.float32)
-    rgb *= mul
-    # A channel at the sensor's ceiling, scaled by white balance, would turn highlights
-    # pink; clip every channel where the least-scaled one tops out, so they stay white.
-    # Values below zero (shadow noise) are kept until the tone curve: clipping them
-    # earlier would lift the average of each channel, and with red and blue amplified
-    # by white balance, turn lifted shadows purple.
-    np.minimum(rgb, mul.min(), out=rgb)
-    rgb = rgb @ color.rgb_cam.T.astype(np.float32)
-
-    strength = s["compress"] / 100 * MAX_COMPRESSION
-    if strength:
-        lum = np.log2(np.maximum(rgb @ LUMA, LOG_FLOOR))
-        a, b = upsample(coeffs, *rgb.shape[:2])
-        base = a * lum + b
-        rgb *= np.exp2(strength * (ANCHOR - base))[..., None]
-
-    rgb *= np.float32(2.0 ** s["exposure"])
-
-    if s["saturation"]:
-        lum = (rgb @ LUMA)[..., None]
-        rgb -= lum
-        rgb *= np.float32(1 + s["saturation"] / 100)
-        rgb += lum
-
-    rgb = tone_curve(rgb)
-    return np.round(oetf(rgb) * 255).astype(np.uint8)
-
-
-def tone_curve(x: np.ndarray) -> np.ndarray:
-    t = (np.maximum(x, 0) * CURVE_GAIN) ** CURVE_C
-    return np.minimum((1 + CURVE_K) * t / (t + CURVE_K), 1.0)
-
-
-def oetf(x: np.ndarray) -> np.ndarray:
-    return np.where(x <= 0.0031308, 12.92 * x, 1.055 * np.power(np.maximum(x, 0.0031308), 1 / 2.4) - 0.055)
+    return {
+        **base_uniforms(color),
+        "mul": color.multipliers(s["temp"]).tolist(),
+        "compress": s["compress"],
+        "exposure": s["exposure"],
+        "saturation": s["saturation"],
+    }
 
 
 def base_coefficients(rgb_cam: np.ndarray, color: Color) -> np.ndarray:
@@ -234,23 +216,6 @@ def _box(x: np.ndarray, r: int) -> np.ndarray:
         return (np.take(c, hi, axis=axis) - np.take(c, lo, axis=axis)) / (hi - lo).reshape(shape)
 
     return along(along(x, 0), 1).astype(np.float32)
-
-
-def upsample(coeffs: np.ndarray, height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
-    """Bilinear upsampling sampled at pixel centres, like a GL texture with LINEAR filtering."""
-
-    def axis(n_out, n_in):
-        pos = np.clip((np.arange(n_out) + 0.5) * n_in / n_out - 0.5, 0, n_in - 1)
-        i0 = np.floor(pos).astype(np.int64)
-        i1 = np.minimum(i0 + 1, n_in - 1)
-        return i0, i1, (pos - i0).astype(np.float32)
-
-    h, w = coeffs.shape[:2]
-    x0, x1, wx = axis(width, w)
-    rows = coeffs[:, x0] * (1 - wx)[None, :, None] + coeffs[:, x1] * wx[None, :, None]
-    y0, y1, wy = axis(height, h)
-    out = rows[y0] * (1 - wy)[:, None, None] + rows[y1] * wy[:, None, None]
-    return out[..., 0], out[..., 1]
 
 
 # --- Entry points -------------------------------------------------------------------------
@@ -300,6 +265,7 @@ def preview(data: bytes, long_side: int) -> bytes:
         "height": h,
         "coeffWidth": coeffs.shape[1],
         "coeffHeight": coeffs.shape[0],
+        "uniforms": base_uniforms(color),
         **color.header(),
     }
     head = json.dumps(header).encode()
@@ -315,7 +281,9 @@ def preview(data: bytes, long_side: int) -> bytes:
 
 
 def develop(data: bytes, settings: dict, half_size: bool = False) -> np.ndarray:
-    """Full pipeline on a whole raw file -> sRGB uint8 (HxWx3)."""
+    """A whole raw file, developed -> sRGB uint8 (HxWx3)."""
+    from . import gpu
+
     rgb, color = decode(data, half_size)
     coeffs = base_coefficients(rgb, color)
-    return to_srgb(rgb, color, coeffs, settings)
+    return gpu.render(rgb, coeffs, uniforms(color, settings))

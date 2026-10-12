@@ -1,57 +1,15 @@
 'use strict';
 
-// WebGL version of develop.py's to_srgb, so edits preview instantly. The server sends,
-// once per photo, linear camera RGB, the base-layer coefficients and the white balance
-// multipliers for every temperature; the per-pixel maths the sliders drive happens here.
-// Keep in sync with develop.py.
+// Runs the develop shader (develop.frag) in the browser, so edits preview instantly.
+// The server runs the very same shader for exports (gpu.py). Per photo it sends linear
+// camera RGB, the base-layer coefficients, the shader's fixed inputs and the white
+// balance multipliers for every temperature; the sliders only pick values.
 
-const VERTEX_SHADER = `#version 300 es
-in vec2 pos;
-out vec2 uv;
-void main() {
-  uv = vec2(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);  // row 0 of the textures is the top
-  gl_Position = vec4(pos, 0.0, 1.0);
-}`;
-
-const FRAGMENT_SHADER = `#version 300 es
-precision highp float;
-in vec2 uv;
-out vec4 color;
-uniform sampler2D cam;     // linear camera RGB, black 0, sensor saturation 1
-uniform sampler2D coeffs;  // base layer = a * log2(luminance) + b
-uniform vec3 mul;          // white balance multipliers
-uniform float clipLevel;
-uniform mat3 rgbCam;       // camera RGB -> linear sRGB
-uniform float strength;    // dynamic range compression, 0..MAX_COMPRESSION
-uniform float anchor;
-uniform float logFloor;
-uniform float exposure;    // as a factor
-uniform float saturation;  // as a factor
-uniform vec3 curve;        // gain, contrast, shoulder
-const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
-
-vec3 toneCurve(vec3 x) {
-  vec3 t = pow(max(x, 0.0) * curve.x, vec3(curve.y));
-  return min((1.0 + curve.z) * t / (t + curve.z), 1.0);
+async function loadShaders() {
+  const get = (name) => fetch(`/static/${name}?v=${S.version}`).then((r) => r.text());
+  const [vertex, fragment] = await Promise.all([get('develop.vert'), get('develop.frag')]);
+  return { vertex, fragment };
 }
-
-vec3 oetf(vec3 x) {
-  return mix(12.92 * x, 1.055 * pow(max(x, 0.0031308), vec3(1.0 / 2.4)) - 0.055, step(0.0031308, x));
-}
-
-void main() {
-  vec3 rgb = min(texture(cam, uv).rgb * mul, vec3(clipLevel));
-  rgb = rgbCam * rgb;
-  if (strength > 0.0) {
-    float l = log2(max(dot(rgb, LUMA), logFloor));
-    vec2 ab = texture(coeffs, uv).rg;
-    rgb *= exp2(strength * (anchor - (ab.x * l + ab.y)));
-  }
-  rgb *= exposure;
-  float lum = dot(rgb, LUMA);
-  rgb = lum + (rgb - lum) * saturation;
-  color = vec4(oetf(toneCurve(rgb)), 1.0);
-}`;
 
 function parsePreview(buffer) {
   // Layout written by develop.preview.
@@ -64,14 +22,13 @@ function parsePreview(buffer) {
 }
 
 class Developer {
-  constructor(canvas, pipeline) {
+  constructor(canvas, shaders) {
     this.canvas = canvas;
-    this.pipeline = pipeline;
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
     if (!gl) throw new Error('This browser has no WebGL2');
     this.gl = gl;
     const program = gl.createProgram();
-    for (const [type, src] of [[gl.VERTEX_SHADER, VERTEX_SHADER], [gl.FRAGMENT_SHADER, FRAGMENT_SHADER]]) {
+    for (const [type, src] of [[gl.VERTEX_SHADER, shaders.vertex], [gl.FRAGMENT_SHADER, shaders.fragment]]) {
       const s = gl.createShader(type);
       gl.shaderSource(s, src);
       gl.compileShader(s);
@@ -82,10 +39,7 @@ class Developer {
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
     gl.useProgram(program);
     this.program = program;
-    this.loc = {};
-    for (const u of ['cam', 'coeffs', 'mul', 'clipLevel', 'rgbCam', 'strength', 'anchor', 'logFloor', 'exposure', 'saturation', 'curve']) {
-      this.loc[u] = gl.getUniformLocation(program, u);
-    }
+    this.locations = new Map();
     const quad = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, quad);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
@@ -94,8 +48,8 @@ class Developer {
     gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 0, 0);
     this.camTex = this.texture(0);
     this.coeffTex = this.texture(1);
-    gl.uniform1i(this.loc.cam, 0);
-    gl.uniform1i(this.loc.coeffs, 1);
+    gl.uniform1i(gl.getUniformLocation(program, 'cam'), 0);
+    gl.uniform1i(gl.getUniformLocation(program, 'coeffs'), 1);
     this.info = null;
   }
 
@@ -123,23 +77,30 @@ class Developer {
     this.info = info;
   }
 
-  draw(settings) {
+  set(uniforms) {
+    // By shape: a number is a float, 3 numbers a vec3, 9 a mat3 (column-major).
     const gl = this.gl;
-    const p = this.pipeline;
+    for (const [name, value] of Object.entries(uniforms)) {
+      if (!this.locations.has(name)) this.locations.set(name, gl.getUniformLocation(this.program, name));
+      const loc = this.locations.get(name);
+      if (typeof value === 'number') gl.uniform1f(loc, value);
+      else if (value.length === 3) gl.uniform3fv(loc, value);
+      else if (value.length === 9) gl.uniformMatrix3fv(loc, false, value);
+    }
+  }
+
+  draw(settings) {
     const info = this.info;
     if (!info) return;
-    // The server sends the multipliers for every temperature on the slider's grid.
-    const mul = settings.temp == null ? info.asShot : info.wb[settings.temp];
+    this.set({
+      ...info.uniforms,
+      mul: settings.temp == null ? info.asShot : info.wb[settings.temp],
+      compress: settings.compress,
+      exposure: settings.exposure,
+      saturation: settings.saturation,
+    });
+    const gl = this.gl;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.uniform3fv(this.loc.mul, mul);
-    gl.uniform1f(this.loc.clipLevel, Math.min(...mul));
-    gl.uniformMatrix3fv(this.loc.rgbCam, true, info.rgbCam.flat());
-    gl.uniform1f(this.loc.strength, (settings.compress / 100) * p.maxCompression);
-    gl.uniform1f(this.loc.anchor, p.anchor);
-    gl.uniform1f(this.loc.logFloor, p.logFloor);
-    gl.uniform1f(this.loc.exposure, 2 ** settings.exposure);
-    gl.uniform1f(this.loc.saturation, 1 + settings.saturation / 100);
-    gl.uniform3f(this.loc.curve, p.curveGain, p.curveC, p.curveK);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 }

@@ -30,7 +30,7 @@ from .raw import IMAGE_EXTS, RAW_EXTS, Photo
 WEB = Path(__file__).parent / "web"
 STATE_FILE = ".photos.json"
 MARKS = {"keep", "reject"}
-STATIC_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css"}
+STATIC_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".vert": "text/plain", ".frag": "text/plain"}
 
 
 def _natural_key(name: str):
@@ -261,14 +261,6 @@ class Handler(BaseHTTPRequestHandler):
                     "defaults": develop.DEFAULTS,
                     "limits": develop.LIMITS,
                     "tempStep": develop.TEMP_STEP,
-                    "pipeline": {
-                        "curveGain": develop.CURVE_GAIN,
-                        "curveC": develop.CURVE_C,
-                        "curveK": develop.CURVE_K,
-                        "anchor": develop.ANCHOR,
-                        "maxCompression": develop.MAX_COMPRESSION,
-                        "logFloor": develop.LOG_FLOOR,
-                    },
                 }
             )
         if path == "/api/export":
