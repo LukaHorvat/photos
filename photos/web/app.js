@@ -548,6 +548,7 @@ function updateHeader() {
   $('#filter').classList.toggle('on', S.filter !== 'all');
   $('#auto').classList.toggle('on', S.auto);
   $('#zoomchip').hidden = !S.zoom || S.view !== 'loupe';
+  $('#deleteRejected').hidden = reject === 0;
   $('#clipchip').hidden = !S.clip || S.view !== 'loupe';
   document.title = name ? `${name} · Cull` : 'Cull';
 }
@@ -667,6 +668,41 @@ document.addEventListener('keydown', (e) => {
       return;
   }
   e.preventDefault();
+});
+
+// --- Deleting the rejected photos ----------------------------------------------------------
+
+const sizeText = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
+
+$('#deleteRejected').addEventListener('click', async () => {
+  try {
+    const r = await (await fetch('/api/rejected')).json();
+    if (!r.photos) return toast('No rejected photos');
+    const what = `${r.photos} rejected photo${r.photos === 1 ? '' : 's'}` + (r.files > r.photos ? ` and ${r.files - r.photos} file${r.files - r.photos === 1 ? '' : 's'} that go with them` : '');
+    const where = r.recycle ? 'to the Recycle Bin' : 'permanently (there is no Recycle Bin here)';
+    if (!confirm(`Delete ${what} (${sizeText(r.bytes)}) ${where}?`)) return;
+    toast('Deleting…');
+    const res = await (await fetch('/api/delete-rejected', { method: 'POST' })).json();
+    // Stay where you were: on this photo, or the nearest one that's left.
+    const here = S.order.get(current() ?? S.lastName) ?? 0;
+    const left = (n) => S.marks[n] !== 'reject';
+    const keep = S.photos.slice(here).find(left) ?? S.photos.slice(0, here).reverse().find(left);
+    const st = await (await fetch('/api/state')).json();
+    S.photos = st.photos;
+    S.order = new Map(S.photos.map((n, i) => [n, i]));
+    S.marks = st.marks;
+    ED.loaded = false; // the editor's series and runs changed
+    rebuildList(keep);
+    render();
+    save();
+    if (res.errors.length) {
+      toast(`Deleted ${res.deleted}; ${res.errors.length} couldn't be: ${res.errors[0]}`, true);
+    } else {
+      toast(`Deleted ${res.deleted} rejected photo${res.deleted === 1 ? '' : 's'} ${r.recycle ? 'to the Recycle Bin' : ''}`);
+    }
+  } catch (err) {
+    toast(`Couldn't delete: ${err.message}`, true);
+  }
 });
 
 // --- Modes ------------------------------------------------------------------------------

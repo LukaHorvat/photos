@@ -23,13 +23,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import denoise, develop, edits
+from . import denoise, develop, edits, trash
 from .export import export_photo
 from .raw import IMAGE_EXTS, RAW_EXTS, Photo, read_file
 
 WEB = Path(__file__).parent / "web"
 STATE_FILE = ".photos.json"
 MARKS = {"keep", "reject"}
+SIDECARS = {".xmp", ".arp", ".pp3", ".dop"}  # editors' settings files: DSC_0001.xmp or DSC_0001.NEF.xmp
 STATIC_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".vert": "text/plain", ".frag": "text/plain"}
 
 
@@ -144,6 +145,45 @@ class Library:
             else:
                 self.state["marks"].pop(name, None)
             self._save()
+
+    def _files(self, names: list[str]) -> list[Path]:
+        """The photos' files, with the files that belong to them in the folder: the other half of a
+        RAW+JPEG pair, and sidecars."""
+        wanted = {self.photos[n].path.name.lower(): self.photos[n].path for n in names}
+        stems = {p.stem.lower() for p in wanted.values()}
+        out = list(wanted.values())
+        for entry in os.scandir(self.folder):
+            name, p = entry.name.lower(), Path(entry.path)
+            if name in wanted or not entry.is_file():
+                continue
+            ext = p.suffix.lower()
+            companion = ext in SIDECARS and (p.stem.lower() in stems or p.stem.lower() in wanted)
+            if companion or (ext in IMAGE_EXTS and p.stem.lower() in stems):
+                out.append(p)
+        return out
+
+    def rejected(self) -> dict:
+        """What delete_rejected() would remove."""
+        names = [n for n in self.names if self.state["marks"].get(n) == "reject"]
+        files = self._files(names)
+        return {"photos": len(names), "files": len(files), "bytes": sum(f.stat().st_size for f in files), "recycle": trash.recycles(self.folder)}
+
+    def delete_rejected(self) -> dict:
+        """Delete the rejected photos and their files (to the Recycle Bin, where there is one).
+        The other photos keep the settings they have, even where an edit started on a deleted one."""
+        with self._save_lock:
+            names = [n for n in self.names if self.state["marks"].get(n) == "reject"]
+            settings = self.settings()
+            errors = trash.remove(self._files(names))
+            gone = [n for n in names if not self.photos[n].path.exists()]
+            for n in gone:
+                del self.photos[n]
+                self.state["marks"].pop(n, None)
+            self.names = list(self.photos)
+            self._groups = None  # a deleted photo may have been what held a series together
+            self.state["edits"] = edits.normalize(self.names, self.groups(), {n: settings[n] for n in self.names})
+            self._save()
+        return {"deleted": len(gone), "errors": errors}
 
     def groups(self) -> list[int]:
         """Series number of every photo; reads all headers the first time (~1 s)."""
@@ -281,6 +321,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/export":
             return self._json(self.lib.export.snapshot())
+        if path == "/api/rejected":
+            return self._json(self.lib.rejected())
         kind, _, name = path.lstrip("/").partition("/")
         photo = self.lib.photos.get(name)
         if photo is None:
@@ -338,6 +380,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self.lib.set_edit(name, body.get("settings") or {}))
         if self.path == "/api/export":
             return self._json(self.lib.export.start())
+        if self.path == "/api/delete-rejected":
+            return self._json(self.lib.delete_rejected())
         if self.path != "/api/mark":
             return self.send_error(HTTPStatus.NOT_FOUND)
         name, mark = body.get("name"), body.get("mark")

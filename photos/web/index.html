@@ -19,6 +19,7 @@
   <span id="exif"></span>
   <span class="spacer"></span>
   <span id="counts" class="cull-only"></span>
+  <button id="deleteRejected" class="chip cull-only" title="Delete the rejected photos from disk (asks first)" hidden>Delete rejected…</button>
   <button id="zoomchip" class="chip on cull-only" hidden>100%</button>
   <button id="clipchip" class="chip on clip cull-only" hidden>raw clipping</button>
   <button id="filter" class="chip cull-only"></button>
@@ -95,6 +96,8 @@
       <tr><td><kbd>↑</kbd> or <kbd>P</kbd></td><td>keep</td></tr>
       <tr><td><kbd>↓</kbd> or <kbd>X</kbd></td><td>reject</td></tr>
       <tr><td><kbd>U</kbd></td><td>clear mark</td></tr>
+      <tr><td>Delete rejected…</td><td>deletes the rejected photos, with their sidecars (.xmp, .arp) and the JPEG of a RAW+JPEG pair,
+        to the Recycle Bin on a Windows drive; asks first</td></tr>
       <tr><td><kbd>Z</kbd> or click</td><td>zoom to 100% at the cursor; drag to pan. Zoom stays on while you browse, to compare focus</td></tr>
       <tr><td><kbd>J</kbd></td><td>raw clipping in magenta: a sensor channel saturated, or all four photosites at black level. The whole raw has to be decoded, so on a photo it hasn't prepared yet it takes up to a second; the next few are prepared in the background while you look</td></tr>
       <tr><td><kbd>G</kbd></td><td>grid (<kbd>Enter</kbd> or double-click to open a photo, <kbd>↑</kbd> <kbd>↓</kbd> move rows)</td></tr>
