@@ -128,15 +128,22 @@ function updateNoise() {
 }
 
 for (const b of document.querySelectorAll('#nr button')) {
-  b.addEventListener('click', () => {
-    if (!ED.live) return;
-    ED.live = { ...ED.live, noise: NR_SETTING[b.dataset.nr] };
-    updateSliders();
-    commit();
+  b.addEventListener('click', () => { if (ED.live) setSettings({ ...ED.live, noise: NR_SETTING[b.dataset.nr] }); });
+}
+
+function setSettings(settings) {
+  // A change made at once (not dragged): saved, and if noise reduction changed, the
+  // final data for it fetched.
+  const noiseChanged = (settings.noise ?? null) !== (ED.live.noise ?? null);
+  ED.live = settings;
+  ED.before = false;
+  updateSliders();
+  commit();
+  if (noiseChanged) {
     loadEdit(editCurrent());
     if (ED.zoom) layoutEdit();
-    requestDraw();
-  });
+  }
+  requestDraw();
 }
 
 function updateSliders() {
@@ -171,21 +178,33 @@ for (const el of SLIDERS) {
   input.addEventListener('change', commit);
   // Hand the arrow keys back to photo navigation once the mouse lets go.
   input.addEventListener('pointerup', () => setTimeout(() => input.blur(), 0));
-  el.addEventListener('dblclick', () => {
-    if (!ED.live) return;
-    ED.live = { ...ED.live, [key]: ED.defaults[key] };
-    updateSliders();
-    requestDraw();
-    commit();
-  });
+  el.addEventListener('dblclick', () => { if (ED.live) setSettings({ ...ED.live, [key]: ED.defaults[key] }); });
 }
 
-$('#resetPhoto').addEventListener('click', () => {
-  if (!ED.live) return;
-  ED.live = { ...ED.defaults };
-  updateSliders();
-  requestDraw();
-  commit();
+$('#resetPhoto').addEventListener('click', () => { if (ED.live) setSettings({ ...ED.defaults }); });
+
+// Ctrl C / Ctrl V: copy this photo's settings, paste them onto another (where, like any
+// change, they also reach the rest of its series). Through the system clipboard, as JSON.
+document.addEventListener('copy', (e) => {
+  if (S.mode !== 'edit' || !ED.live) return;
+  e.preventDefault();
+  e.clipboardData.setData('text/plain', JSON.stringify({ photoSettings: ED.live, from: editCurrent() }));
+  toast(`Copied the settings of ${editCurrent()}`);
+});
+
+document.addEventListener('paste', (e) => {
+  if (S.mode !== 'edit' || !ED.live) return;
+  e.preventDefault();
+  let copied = null;
+  try {
+    copied = JSON.parse(e.clipboardData.getData('text/plain'));
+  } catch {}
+  if (!copied?.photoSettings) {
+    toast("Nothing to paste: copy a photo's settings first (Ctrl C)", true);
+    return;
+  }
+  setSettings(Object.fromEntries(Object.keys(ED.defaults).map((k) => [k, copied.photoSettings[k] ?? ED.defaults[k]])));
+  toast(`Pasted the settings of ${copied.from} onto ${editCurrent()}`);
 });
 
 function commit() {
