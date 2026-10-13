@@ -23,6 +23,7 @@
   <button id="clipchip" class="chip on clip cull-only" hidden>raw clipping</button>
   <button id="filter" class="chip cull-only"></button>
   <button id="auto" class="chip cull-only">auto-advance</button>
+  <button id="editzoom" class="chip on edit-only" title="Back to the whole photo (Z or Esc)" hidden>100%</button>
   <span id="exportStatus" class="edit-only"></span>
   <button id="exportBtn" class="chip edit-only" title="Develop every kept photo at full size into the export folder">Export kept</button>
   <button id="helpchip" class="chip">? keys</button>
@@ -98,8 +99,11 @@
     <table class="edit-only">
       <tr><td><kbd>←</kbd> <kbd>→</kbd> <kbd>Space</kbd></td><td>previous / next kept photo</td></tr>
       <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first / last</td></tr>
+      <tr><td><kbd>Z</kbd> or click</td><td>100% at the cursor, as the export will be: full size, with its noise reduction (the
+        whole-photo view has none); drag to pan. Stays on while you browse</td></tr>
       <tr><td><kbd>\</kbd></td><td>before / after: the photo without edits</td></tr>
       <tr><td>double-click a slider</td><td>reset it</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>leave before / after, then 100%</td></tr>
       <tr><td><kbd>E</kbd></td><td>back to picking (rejected and unmarked photos are there)</td></tr>
     </table>
     <p class="edit-only">Photos are grouped into series: a pause of more than 10 seconds between two shots starts a new

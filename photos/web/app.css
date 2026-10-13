@@ -218,6 +218,8 @@ body.mode-edit .cull-only { display: none !important; }
 
 #editview { position: relative; overflow: hidden; min-height: 0; }
 #editcanvas, #editplaceholder { position: absolute; }
+#editview.zoomed { cursor: grab; }
+#editview.zoomed:active { cursor: grabbing; }
 #editnote {
   position: absolute;
   left: 12px;

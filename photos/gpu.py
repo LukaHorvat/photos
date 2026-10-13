@@ -35,13 +35,29 @@ def render(rgb, coeffs, uniforms, tone, table, noise=None) -> np.ndarray:
 
     Conversions happen here, on the caller's thread, so the GL thread only does GL work
     (it is shared by all exports)."""
+    grain = None if noise is None else _f32(noise.grain)
+    out = _run(_render, _rgba16(rgb), _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain)
+    return np.ascontiguousarray(out[::-1, :, :3])  # GL reads the bottom row first
+
+
+def denoised(rgb, noise) -> tuple[np.ndarray, np.ndarray]:
+    """What render() feeds the develop shader when given `noise`, read back: camera RGB with
+    colour noise smoothed (HxWx4 float16) and the grain to give back (HxW float16). The
+    editor's 100% view runs the shader on these in the browser, so it shows the export."""
+    h, w = rgb.shape[:2]
+    cam, grain = _run(_denoised, _rgba16(rgb), noise, _f32(noise.grain))
+    return np.frombuffer(cam, np.float16).reshape(h, w, 4), np.frombuffer(grain, np.float16).reshape(h, w)
+
+
+def _rgba16(rgb) -> np.ndarray:
     cam = np.empty(rgb.shape[:2] + (4,), np.float16)  # RGBA16F: the fastest upload, as in the browser
     cam[..., :3] = rgb
     cam[..., 3] = 0
-    f32 = lambda a: np.ascontiguousarray(a, np.float32)
-    grain = None if noise is None else f32(noise.grain)
-    out = _run(_render, cam, f32(coeffs), uniforms, f32(tone), f32(table), noise, grain)
-    return np.ascontiguousarray(out[::-1, :, :3])  # GL reads the bottom row first
+    return cam
+
+
+def _f32(a) -> np.ndarray:
+    return np.ascontiguousarray(a, np.float32)
 
 
 def raw_nlm(mosaic: np.ndarray, black: float, A: float, B: float, weights, h: float, search: int, patch: int):
@@ -426,6 +442,22 @@ def _grain(removed, weights, size):
         _release(half, rows, *fbs)
 
 
+def _with_noise(cam, noise, removed, size) -> tuple:
+    """The develop shader's camera RGB and grain textures, from the camera RGB texture."""
+    smoothed = _chroma_nr(cam, size, noise.as_shot.astype(np.float32), noise.rgb_cam)
+    return smoothed, _grain(removed, noise.weights, size)
+
+
+def _denoised(cam, noise, removed) -> tuple[bytes, bytes]:
+    h, w = cam.shape[:2]
+    src = _texture((w, h), 4, cam, dtype="f2")
+    smoothed, grain = _with_noise(src, noise, removed, (w, h))
+    try:
+        return _read(smoothed), _read(grain)
+    finally:
+        _release(src, smoothed, grain)
+
+
 def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
     """RGBA8, bottom row first."""
     import moderngl
@@ -439,10 +471,8 @@ def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
     cam = _texture((w, h), 4, cam, dtype="f2")
     owned.append(cam)
     if noise is not None:
-        smoothed = _chroma_nr(cam, (w, h), noise.as_shot.astype(np.float32), noise.rgb_cam)
-        owned.append(smoothed)
-        cam = smoothed
-        grain = _grain(removed, noise.weights, (w, h))
+        cam, grain = _with_noise(cam, noise, removed, (w, h))
+        owned.append(cam)
     else:
         grain = _texture((1, 1), 1, np.zeros((1, 1), np.float32))
     owned.append(grain)

@@ -35,12 +35,17 @@ raw + JPEG pairs:
 uv run python scripts/calibrate_camera.py /mnt/d/Radno
 ```
 
-Exports also get noise reduction like the camera's (`denoise.py`; not in the
-preview, which is downsampled, so noise hardly shows there): non-local means on
-the raw data before demosaicing, using the noise measured in each photo itself;
-colour noise smoothed along brightness edges; then part of the removed grain
-given back, more at low ISO, as the camera keeps it. It runs on the GPU, about
-0.3 s per photo in a batch.
+Exports also get noise reduction like the camera's (`denoise.py`): non-local
+means on the raw data before demosaicing, using the noise measured in each photo
+itself; colour noise smoothed along brightness edges; then part of the removed
+grain given back, more at low ISO, as the camera keeps it. It runs on the GPU,
+about 0.3 s per photo in a batch.
+
+The whole-photo view is downsampled, so noise hardly shows and it skips noise
+reduction. `Z` (or a click) shows 100% at the cursor as the export will be: the
+server prepares the export's noise-reduced data (~3 s, started once you stay on a
+photo for a second, and for the next photo while zoomed) and sends it in tiles,
+which the same shader develops in the browser, so sliders stay instant.
 
 Photos are grouped into series: a pause of more than 10 seconds between two
 consecutive shots starts a new one (`edits.SERIES_GAP`). A change applies to the

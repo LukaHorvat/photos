@@ -63,6 +63,7 @@ RAW_LINEAR = dict(
     output_bps=16,
     adjust_maximum_thr=0,
 )
+FULL_TILE = 512  # the editor's 100% view loads full-size data in tiles this big
 
 
 # --- Colour temperature --------------------------------------------------------------
@@ -244,7 +245,7 @@ def decode(data: bytes, half_size: bool) -> tuple[np.ndarray, Color]:
     Noise below the black level is kept (as negative values): LibRaw is given a black
     level BLACK_PAD lower than the real one, and the difference is subtracted here.
     """
-    rgb, color, _ = _decode(data, half_size, denoise=False)
+    rgb, color, _, _ = _decode(data, half_size, denoise=False)
     return rgb, color
 
 
@@ -252,14 +253,18 @@ def decode_denoised(data: bytes, iso: int | None):
     """decode() at full size, with noise reduction on the raw data before demosaicing
     (denoise.py); also returns what the develop step needs to finish it (or None if the
     sensor isn't a Bayer one)."""
-    return _decode(data, False, denoise=True, iso=iso)
+    rgb, color, noise, _ = _decode(data, False, denoise=True, iso=iso)
+    return rgb, color, noise
 
 
 def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None):
+    """decode(), plus the noise reduction's leftovers and the full-size (width, height)."""
     from . import denoise as dn
 
     removed = None
     with rawpy.imread(io.BytesIO(data)) as raw:
+        sizes = raw.sizes
+        full_size = (sizes.height, sizes.width) if sizes.flip in (5, 6) else (sizes.width, sizes.height)
         color = Color.from_raw(raw)
         black = min(raw.black_level_per_channel)
         # Lossy NEFs saturate a few codes under the nominal white level (see raw.Photo.clipping_mask).
@@ -277,7 +282,7 @@ def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None)
     noise = None
     if removed is not None:
         noise = dn.Noise(dn.orient(removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(iso))
-    return rgb, color, noise
+    return rgb, color, noise, full_size
 
 
 _looks: dict = {}  # path -> Look: fitted for the editor's preview, reused by the export
@@ -298,7 +303,7 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
     """
     import json
 
-    rgb, color = decode(data, half_size=True)
+    rgb, color, _, (full_width, full_height) = _decode(data, half_size=True, denoise=False)
     look = look_for(photo, data, rgb, color)
     h, w = rgb.shape[:2]
     scale = min(1.0, long_side / max(h, w))
@@ -318,6 +323,9 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
         "toneSize": tone.size,
         "tableSize": [table.shape[2], table.shape[1], table.shape[0]],  # width, height, depth
         "uniforms": base_uniforms(color, look),
+        "fullWidth": full_width,  # for the 100% view (Full)
+        "fullHeight": full_height,
+        "fullTile": FULL_TILE,
         **color.header(),
     }
     head = json.dumps(header).encode()
@@ -326,6 +334,32 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
         [len(head).to_bytes(4, "little"), head]
         + [a.astype(np.float16).tobytes() for a in (rgb, coeffs, tone, table)]
     )
+
+
+@dataclass
+class Full:
+    """The editor's 100% view: what an export feeds the develop shader, at full size. The
+    browser runs the shader on it with the preview's other inputs (the base coefficients
+    are the same at any size), so it shows what the export will."""
+
+    cam: np.ndarray  # camera RGB after noise reduction, H x W x 3 float16
+    grain: np.ndarray  # grain given back, H x W float16
+
+    def tile(self, i: int, j: int) -> bytes:
+        """Tile (column i, row j) of FULL_TILE squares, smaller at the right and bottom edges:
+        its camera RGB, then its grain."""
+        rows, cols = slice(j * FULL_TILE, (j + 1) * FULL_TILE), slice(i * FULL_TILE, (i + 1) * FULL_TILE)
+        return self.cam[rows, cols].tobytes() + self.grain[rows, cols].tobytes()
+
+
+def full(photo, data: bytes) -> Full:
+    from . import gpu
+
+    rgb, color, noise = decode_denoised(data, photo.iso)
+    if noise is None:
+        return Full(rgb.astype(np.float16), np.zeros(rgb.shape[:2], np.float16))
+    cam, grain = gpu.denoised(rgb, noise)
+    return Full(np.ascontiguousarray(cam[..., :3]), grain)
 
 
 def develop(photo, data: bytes, settings: dict) -> np.ndarray:

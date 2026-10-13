@@ -19,6 +19,12 @@ const ED = {
   pos: -1,
   live: null, // the current photo's settings, including a drag not saved yet
   before: false, // showing the photo without edits
+  zoom: false, // 100% view: the full-size photo as an export will develop it, noise reduction included
+  zx: 0.5, // its centre, as a fraction of the photo
+  zy: 0.5,
+  view: null, // where the full-size photo sits on the canvas, while zoomed (see Developer.draw)
+  full: { name: null, loaded: new Map(), pending: new Map(), queue: [] }, // full-size tiles of a photo
+  fullTimer: null,
   dev: null,
   shown: null, // name of the photo whose data is on the GPU
   previews: new Map(), // name -> { promise, abort }
@@ -186,13 +192,19 @@ function preview(name) {
 
 let drawQueued = false;
 function requestDraw() {
-  if (drawQueued) return;
-  drawQueued = true;
-  requestAnimationFrame(() => {
-    drawQueued = false;
-    if (ED.dev && ED.shown && ED.shown === editCurrent()) ED.dev.draw(ED.before ? ED.defaults : ED.live);
-  });
-  $('#editnote').textContent = ED.before ? 'Before' : (ED.shown === editCurrent() ? '' : 'Developing…');
+  if (!drawQueued) {
+    drawQueued = true;
+    requestAnimationFrame(() => {
+      drawQueued = false;
+      if (!(ED.dev && ED.shown && ED.shown === editCurrent())) return;
+      const view = ED.view && { ...ED.view, tiles: visibleTiles().filter((t) => t.loaded).map((t) => t.rect) };
+      ED.dev.draw(ED.before ? ED.defaults : ED.live, view);
+    });
+  }
+  const loading = ED.view && visibleTiles().some((t) => !t.loaded);
+  $('#editnote').textContent = ED.before
+    ? 'Before'
+    : ED.shown !== editCurrent() ? 'Developing…' : loading ? 'Loading full size…' : '';
 }
 
 function layoutEdit() {
@@ -202,6 +214,13 @@ function layoutEdit() {
   const el = onGpu ? editCanvas : editPlaceholder;
   editCanvas.hidden = !onGpu;
   editPlaceholder.hidden = onGpu || !editCurrent();
+  editView.classList.toggle('zoomed', ED.zoom && !!onGpu);
+  $('#editzoom').hidden = !ED.zoom;
+  if (onGpu && ED.zoom) {
+    layoutZoomed(W, H);
+    return;
+  }
+  ED.view = null;
   const iw = onGpu ? ED.dev.info.width : editPlaceholder.naturalWidth || 3;
   const ih = onGpu ? ED.dev.info.height : editPlaceholder.naturalHeight || 2;
   const s = Math.min(W / iw, H / ih);
@@ -209,16 +228,166 @@ function layoutEdit() {
   const h = ih * s;
   Object.assign(el.style, { left: `${(W - w) / 2}px`, top: `${(H - h) / 2}px`, width: `${w}px`, height: `${h}px` });
   if (onGpu) {
-    const cw = Math.round(w * dpr());
-    const ch = Math.round(h * dpr());
-    if (editCanvas.width !== cw || editCanvas.height !== ch) {
-      editCanvas.width = cw;
-      editCanvas.height = ch;
-    }
+    sizeCanvas(Math.round(w * dpr()), Math.round(h * dpr()));
     requestDraw();
   }
 }
 editPlaceholder.addEventListener('load', layoutEdit);
+
+function sizeCanvas(cw, ch) {
+  if (editCanvas.width !== cw || editCanvas.height !== ch) {
+    editCanvas.width = cw;
+    editCanvas.height = ch;
+  }
+}
+
+// --- 100% view ---------------------------------------------------------------------------------
+// One pixel of the full-size photo per screen pixel. The server prepares what an export
+// feeds the develop shader (develop.Full: camera RGB after noise reduction, and the grain
+// given back) and sends it in tiles; the same shader develops them here, so sliders stay
+// instant and you see the export's noise and detail.
+
+const TILE_FETCHES = 6;
+
+function layoutZoomed(W, H) {
+  Object.assign(editCanvas.style, { left: '0px', top: '0px', width: `${W}px`, height: `${H}px` });
+  sizeCanvas(Math.round(W * dpr()), Math.round(H * dpr()));
+  const { fullWidth: fw, fullHeight: fh } = ED.dev.info;
+  const cw = editCanvas.width;
+  const ch = editCanvas.height;
+  ED.zx = clampCentre(ED.zx, cw, fw);
+  ED.zy = clampCentre(ED.zy, ch, fh);
+  ED.view = { x0: Math.round(ED.zx * fw - cw / 2), y0: Math.round(ED.zy * fh - ch / 2), width: fw, height: fh };
+  wantTiles();
+  requestDraw();
+}
+
+function tileRect(i, j) {
+  const { fullWidth: fw, fullHeight: fh, fullTile: T } = ED.dev.info;
+  return [i * T, j * T, Math.min(T, fw - i * T), Math.min(T, fh - j * T)];
+}
+
+function visibleTiles(margin = 0) {
+  // The tiles on the canvas (and `margin` more around it), nearest its centre first.
+  if (!ED.view || ED.full.name !== editCurrent()) return [];
+  const { fullWidth: fw, fullHeight: fh, fullTile: T } = ED.dev.info;
+  const { x0, y0 } = ED.view;
+  const cw = editCanvas.width;
+  const ch = editCanvas.height;
+  const range = (a, size, n) => [Math.max(0, Math.floor(a / T) - margin), Math.min(n - 1, Math.floor((a + size - 1) / T) + margin)];
+  const [i0, i1] = range(x0, cw, Math.ceil(fw / T));
+  const [j0, j1] = range(y0, ch, Math.ceil(fh / T));
+  const tiles = [];
+  for (let j = j0; j <= j1; j++) {
+    for (let i = i0; i <= i1; i++) {
+      const rect = tileRect(i, j);
+      const d = Math.hypot(rect[0] + rect[2] / 2 - x0 - cw / 2, rect[1] + rect[3] / 2 - y0 - ch / 2);
+      tiles.push({ key: `${i},${j}`, rect, d, loaded: ED.full.loaded.has(`${i},${j}`) });
+    }
+  }
+  return tiles.sort((a, b) => a.d - b.d);
+}
+
+function wantTiles() {
+  const name = editCurrent();
+  if (ED.full.name !== name) {
+    for (const abort of ED.full.pending.values()) abort.abort();
+    ED.full = { name, loaded: new Map(), pending: new Map(), queue: [] };
+    ED.dev.allocFull(ED.dev.info.fullWidth, ED.dev.info.fullHeight);
+  }
+  ED.full.queue = visibleTiles(1).filter((t) => !t.loaded && !ED.full.pending.has(t.key));
+  pumpTiles();
+}
+
+function pumpTiles() {
+  const f = ED.full;
+  while (f.pending.size < TILE_FETCHES && f.queue.length) {
+    const { key, rect } = f.queue.shift();
+    const abort = new AbortController();
+    f.pending.set(key, abort);
+    fetch(`/full/${enc(f.name)}?t=${key}&v=${S.version}`, { signal: abort.signal })
+      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.statusText))))
+      .then((buffer) => {
+        if (ED.full !== f || ED.shown !== f.name) return;
+        ED.dev.putTile(...rect, new Uint16Array(buffer));
+        f.loaded.set(key, rect);
+        requestDraw();
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError' && ED.full === f && !f.failed) {
+          f.failed = true;
+          toast(`Couldn't load ${f.name} at full size: ${err.message}`, true);
+        }
+      })
+      .finally(() => {
+        f.pending.delete(key);
+        if (ED.full === f) pumpTiles();
+      });
+  }
+}
+
+function hintFull(names) {
+  fetch('/api/full-hint', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ names: names.filter(Boolean) }),
+  }).catch(() => {});
+}
+
+function toggleEditZoom(px, py) {
+  if (ED.zoom) {
+    ED.zoom = false;
+    layoutEdit();
+    return;
+  }
+  if (!(ED.dev && ED.shown && ED.shown === editCurrent())) return;
+  ED.zoom = true;
+  ED.zx = ED.zy = 0.5;
+  const r = editCanvas.getBoundingClientRect();
+  if (px != null && px >= r.left && px <= r.right && py >= r.top && py <= r.bottom) {
+    // Keep the point under the cursor where it is.
+    const sr = editView.getBoundingClientRect();
+    ED.zx = (px - r.left) / r.width + ((sr.width / 2 - (px - sr.left)) * dpr()) / ED.dev.info.fullWidth;
+    ED.zy = (py - r.top) / r.height + ((sr.height / 2 - (py - sr.top)) * dpr()) / ED.dev.info.fullHeight;
+  }
+  hintFull([editCurrent(), ED.kept[ED.pos + 1]]);
+  layoutEdit();
+}
+
+$('#editzoom').addEventListener('click', () => toggleEditZoom());
+
+let editDrag = null;
+let editPointer = null;
+
+editView.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  editDrag = { x: e.clientX, y: e.clientY, moved: false };
+  editView.setPointerCapture(e.pointerId);
+});
+
+editView.addEventListener('pointermove', (e) => {
+  editPointer = { x: e.clientX, y: e.clientY };
+  if (!editDrag) return;
+  const dx = e.clientX - editDrag.x;
+  const dy = e.clientY - editDrag.y;
+  if (!editDrag.moved && Math.hypot(dx, dy) < 4) return;
+  editDrag.moved = true;
+  if (ED.view) {
+    ED.zx -= (dx * dpr()) / ED.view.width;
+    ED.zy -= (dy * dpr()) / ED.view.height;
+    editDrag.x = e.clientX;
+    editDrag.y = e.clientY;
+    layoutEdit();
+  }
+});
+
+editView.addEventListener('pointerup', (e) => {
+  const d = editDrag;
+  editDrag = null;
+  if (d && !d.moved) toggleEditZoom(e.clientX, e.clientY);
+});
+
+editView.addEventListener('pointerleave', () => { if (!editDrag) editPointer = null; });
 
 let editTimer;
 function showEdit() {
@@ -275,6 +444,11 @@ function loadEdit(name) {
       }
       updateSliders(); // the as-shot temperature is known now
       layoutEdit();
+      // Get the full size ready: now if it's on screen, else once you stay on the photo, so
+      // zooming in is quick.
+      clearTimeout(ED.fullTimer);
+      if (ED.zoom) hintFull([name, ED.kept[ED.pos + 1]]);
+      else ED.fullTimer = setTimeout(() => { if (editCurrent() === name && S.mode === 'edit') hintFull([name]); }, 1000);
       // Then the neighbours, so the next photo is ready when you get there.
       for (const n of near.slice(1)) preview(n).catch(() => {});
     })
@@ -428,6 +602,7 @@ async function editorEnter(name) {
 
 function editorLeave() {
   clearTimeout(editTimer);
+  clearTimeout(ED.fullTimer);
   return editCurrent();
 }
 
@@ -456,10 +631,15 @@ function editorKey(e, k) {
       ED.before = !ED.before;
       requestDraw();
       return true;
+    case 'z':
+      toggleEditZoom(editPointer?.x, editPointer?.y);
+      return true;
     case 'Escape':
       if (ED.before) {
         ED.before = false;
         requestDraw();
+      } else if (ED.zoom) {
+        toggleEditZoom();
       }
       return true;
     case 'e':

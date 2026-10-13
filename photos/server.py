@@ -109,6 +109,8 @@ class Library:
         self.previews = Prefetcher(
             lambda key: develop.preview(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
+        # The editor's 100% view: ~200 MB and ~2 s of work each, so one at a time and few kept.
+        self.fulls = Prefetcher(lambda name: develop.full(self.photos[name], read_file(self.photos[name].path)), workers=1, keep=2)
         self.state_path = folder / STATE_FILE
         self.state = self._load()
         self._save_lock = threading.Lock()
@@ -277,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send([photo.thumbnail()], "image/jpeg", cache=True)
             if kind == "meta":
                 return self._json(photo.meta(), cache=True)
-            if kind in ("clip", "develop") and not photo.is_raw:
+            if kind in ("clip", "develop", "full") and not photo.is_raw:
                 return self.send_error(HTTPStatus.NOT_FOUND, "not a raw file")
             if kind == "clip":
                 self.lib.clips.result(name)
@@ -285,6 +287,9 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "develop":
                 data = self.lib.previews.result((name, preview_size(w)))
                 return self._send([data], "application/octet-stream")
+            if kind == "full":
+                i, j = (int(v) for v in query["t"][0].split(","))
+                return self._send([self.lib.fulls.result(name).tile(i, j)], "application/octet-stream")
         except ConnectionError:
             raise
         except Exception as e:
@@ -302,6 +307,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/develop-hint":
             size = preview_size(int(body.get("w", 0)))
             self.lib.previews.want([(n, size) for n in raws])
+            return self._json({"ok": True})
+        if self.path == "/api/full-hint":
+            self.lib.fulls.want(raws)
             return self._json({"ok": True})
         if self.path == "/api/edit":
             name = body.get("name")
@@ -382,5 +390,5 @@ def serve(folder: Path, port: int, browser: bool, mode: str = "cull"):
     except KeyboardInterrupt:
         print()
     finally:
-        for p in (lib.clips, lib.previews):
+        for p in (lib.clips, lib.previews, lib.fulls):
             p.pool.shutdown(wait=False, cancel_futures=True)
