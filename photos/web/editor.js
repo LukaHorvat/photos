@@ -24,10 +24,11 @@ const ED = {
   zy: 0.5,
   view: null, // where the full-size photo sits on the canvas, while zoomed (see Developer.draw)
   full: { name: null, loaded: new Map(), pending: new Map(), queue: [] }, // full-size tiles of a photo
-  fullTimer: null,
   dev: null,
   shown: null, // name of the photo whose data is on the GPU
-  previews: new Map(), // name -> { promise, abort }
+  shownDenoised: false, // whether that's the noise-reduced preview yet
+  previews: new Map(), // name -> { promise, abort, info }: quick previews
+  denoised: new Map(), // the same, noise-reduced
   cells: [],
   saving: Promise.resolve(),
 };
@@ -176,16 +177,23 @@ function previewSide() {
   return Math.ceil(Math.max(Math.min(w, h * 1.5), Math.min(h, w * 1.5)) * dpr());
 }
 
-function preview(name) {
-  let p = ED.previews.get(name);
+// Each photo comes in two steps: a quick preview without noise reduction (~0.5 s), then
+// the export's own input shrunk, noise reduction included (develop.denoised_preview; ~3 s,
+// unless the server prepared it while you were on the photo before).
+function preview(name, denoised = false) {
+  const cache = denoised ? ED.denoised : ED.previews;
+  let p = cache.get(name);
   if (!p) {
     const abort = new AbortController();
-    const promise = fetch(`/develop/${enc(name)}?w=${previewSide()}&v=${S.version}`, { signal: abort.signal })
+    const promise = fetch(`/develop/${enc(name)}?w=${previewSide()}${denoised ? '&nr=1' : ''}&v=${S.version}`, { signal: abort.signal })
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.statusText))))
       .then(parsePreview);
-    promise.catch(() => { if (ED.previews.get(name)?.promise === promise) ED.previews.delete(name); });
-    p = { promise, abort };
-    ED.previews.set(name, p);
+    p = { promise, abort, info: null };
+    promise.then(
+      (info) => { p.info = info; },
+      () => { if (cache.get(name) === p) cache.delete(name); },
+    );
+    cache.set(name, p);
   }
   return p.promise;
 }
@@ -204,7 +212,9 @@ function requestDraw() {
   const loading = ED.view && visibleTiles().some((t) => !t.loaded);
   $('#editnote').textContent = ED.before
     ? 'Before'
-    : ED.shown !== editCurrent() ? 'Developing…' : loading ? 'Loading full size…' : '';
+    : ED.shown !== editCurrent() ? 'Developing…'
+    : loading ? 'Loading full size…'
+    : !ED.shownDenoised ? 'Reducing noise…' : '';
 }
 
 function layoutEdit() {
@@ -326,14 +336,6 @@ function pumpTiles() {
   }
 }
 
-function hintFull(names) {
-  fetch('/api/full-hint', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ names: names.filter(Boolean) }),
-  }).catch(() => {});
-}
-
 function toggleEditZoom(px, py) {
   if (ED.zoom) {
     ED.zoom = false;
@@ -350,7 +352,6 @@ function toggleEditZoom(px, py) {
     ED.zx = (px - r.left) / r.width + ((sr.width / 2 - (px - sr.left)) * dpr()) / ED.dev.info.fullWidth;
     ED.zy = (py - r.top) / r.height + ((sr.height / 2 - (py - sr.top)) * dpr()) / ED.dev.info.fullHeight;
   }
-  hintFull([editCurrent(), ED.kept[ED.pos + 1]]);
   layoutEdit();
 }
 
@@ -429,32 +430,40 @@ function loadEdit(name) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ names: near, w: previewSide() }),
   }).catch(() => {});
-  for (const [n, p] of ED.previews) {
-    if (!near.includes(n)) {
-      p.abort.abort();
-      ED.previews.delete(n);
+  // The server prepares noise-reduced data for this photo and the next only (see develop-hint).
+  for (const [cache, keep] of [[ED.previews, near], [ED.denoised, near.slice(0, 2)]]) {
+    for (const [n, p] of cache) {
+      if (!keep.includes(n)) {
+        p.abort.abort();
+        cache.delete(n);
+      }
     }
   }
-  preview(name)
+  const show = (info) => {
+    if (editCurrent() !== name || S.mode !== 'edit') return;
+    ED.dev.load(info);
+    ED.shown = name;
+    ED.shownDenoised = info.grain;
+    updateSliders(); // the as-shot temperature is known now
+    layoutEdit();
+    // Then the neighbours, so the next photo is ready when you get there.
+    for (const n of near.slice(1)) preview(n).catch(() => {});
+  };
+  const failed = (err) => {
+    if (err.name !== 'AbortError' && editCurrent() === name) toast(`Couldn't develop ${name}: ${err.message}`, true);
+  };
+  const ready = ED.denoised.get(name)?.info;
+  if (ready) {
+    if (!(ED.shown === name && ED.shownDenoised)) show(ready);
+  } else {
+    preview(name).then((info) => { if (ED.shown !== name) show(info); }).catch(failed);
+  }
+  preview(name, true)
     .then((info) => {
-      if (editCurrent() !== name || S.mode !== 'edit') return;
-      if (ED.shown !== name) {
-        ED.dev.load(info);
-        ED.shown = name;
-      }
-      updateSliders(); // the as-shot temperature is known now
-      layoutEdit();
-      // Get the full size ready: now if it's on screen, else once you stay on the photo, so
-      // zooming in is quick.
-      clearTimeout(ED.fullTimer);
-      if (ED.zoom) hintFull([name, ED.kept[ED.pos + 1]]);
-      else ED.fullTimer = setTimeout(() => { if (editCurrent() === name && S.mode === 'edit') hintFull([name]); }, 1000);
-      // Then the neighbours, so the next photo is ready when you get there.
-      for (const n of near.slice(1)) preview(n).catch(() => {});
+      if (!(ED.shown === name && ED.shownDenoised)) show(info);
+      if (editCurrent() === name && near[1]) preview(near[1], true).catch(() => {});
     })
-    .catch((err) => {
-      if (err.name !== 'AbortError' && editCurrent() === name) toast(`Couldn't develop ${name}: ${err.message}`, true);
-    });
+    .catch(failed);
 }
 
 // --- Panel and strip -------------------------------------------------------------------------
@@ -602,7 +611,6 @@ async function editorEnter(name) {
 
 function editorLeave() {
   clearTimeout(editTimer);
-  clearTimeout(ED.fullTimer);
   return editCurrent();
 }
 

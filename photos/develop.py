@@ -299,20 +299,38 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
     """Everything the browser needs to develop this photo itself, as one binary blob:
 
     uint32 header length, JSON header, padding to 2 bytes, then float16 camera RGB
-    (height x width x 3), base coefficients (ch x cw x 2), tone curve and colour table.
+    (height x width x 3), base coefficients (ch x cw x 2), tone curve, colour table, and
+    with header["grain"] the grain to give back (height x width).
+
+    This is the quick one, from a half-size decode without noise reduction (~0.5 s);
+    denoised_preview() is what an export will be, shrunk.
     """
+    rgb, color, _, full_size = _decode(data, half_size=True, denoise=False)
+    look = look_for(photo, data, rgb, color)
+    return _preview_blob(_shrink(rgb, long_side), None, color, look, full_size)
+
+
+def denoised_preview(full: "Full", long_side: int) -> bytes:
+    """preview() made from the export's own input, noise reduction included."""
+    h, w = full.cam.shape[:2]
+    return _preview_blob(_shrink(full.cam, long_side), _shrink(full.grain, long_side), full.color, full.look, (w, h))
+
+
+def _shrink(img: np.ndarray, long_side: int) -> np.ndarray:
+    """Averaged down (in linear light) to fit long_side, float32."""
+    h, w = img.shape[:2]
+    scale = min(1.0, long_side / max(h, w))
+    if scale == 1:
+        return img.astype(np.float32)
+    size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    shrink = lambda c: np.asarray(Image.fromarray(np.ascontiguousarray(c, np.float32)).resize(size, Image.Resampling.BOX))
+    return shrink(img) if img.ndim == 2 else np.stack([shrink(img[..., c]) for c in range(img.shape[2])], -1)
+
+
+def _preview_blob(rgb, grain, color: Color, look: Look, full_size) -> bytes:
     import json
 
-    rgb, color, _, (full_width, full_height) = _decode(data, half_size=True, denoise=False)
-    look = look_for(photo, data, rgb, color)
     h, w = rgb.shape[:2]
-    scale = min(1.0, long_side / max(h, w))
-    if scale < 1:
-        size = (max(1, round(w * scale)), max(1, round(h * scale)))
-        rgb = np.stack(
-            [np.asarray(Image.fromarray(np.ascontiguousarray(rgb[..., c])).resize(size, Image.Resampling.BOX)) for c in range(3)], -1
-        )
-        h, w = rgb.shape[:2]
     coeffs = base_coefficients(rgb, color)
     tone, table = look_textures(look)
     header = {
@@ -322,28 +340,29 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
         "coeffHeight": coeffs.shape[0],
         "toneSize": tone.size,
         "tableSize": [table.shape[2], table.shape[1], table.shape[0]],  # width, height, depth
+        "grain": grain is not None,
         "uniforms": base_uniforms(color, look),
-        "fullWidth": full_width,  # for the 100% view (Full)
-        "fullHeight": full_height,
+        "fullWidth": full_size[0],  # for the 100% view (Full)
+        "fullHeight": full_size[1],
         "fullTile": FULL_TILE,
         **color.header(),
     }
     head = json.dumps(header).encode()
     head += b" " * (len(head) % 2)
-    return b"".join(
-        [len(head).to_bytes(4, "little"), head]
-        + [a.astype(np.float16).tobytes() for a in (rgb, coeffs, tone, table)]
-    )
+    arrays = (rgb, coeffs, tone, table) + (() if grain is None else (grain,))
+    return b"".join([len(head).to_bytes(4, "little"), head] + [a.astype(np.float16).tobytes() for a in arrays])
 
 
 @dataclass
 class Full:
-    """The editor's 100% view: what an export feeds the develop shader, at full size. The
-    browser runs the shader on it with the preview's other inputs (the base coefficients
-    are the same at any size), so it shows what the export will."""
+    """What an export feeds the develop shader, at full size, for the editor: its 100% view
+    (in tiles) and its noise-reduced whole-photo view (denoised_preview). The browser runs
+    the shader on it, so both show what the export will."""
 
     cam: np.ndarray  # camera RGB after noise reduction, H x W x 3 float16
     grain: np.ndarray  # grain given back, H x W float16
+    color: Color
+    look: Look
 
     def tile(self, i: int, j: int) -> bytes:
         """Tile (column i, row j) of FULL_TILE squares, smaller at the right and bottom edges:
@@ -356,10 +375,11 @@ def full(photo, data: bytes) -> Full:
     from . import gpu
 
     rgb, color, noise = decode_denoised(data, photo.iso)
+    look = look_for(photo, data, rgb, color)
     if noise is None:
-        return Full(rgb.astype(np.float16), np.zeros(rgb.shape[:2], np.float16))
+        return Full(rgb.astype(np.float16), np.zeros(rgb.shape[:2], np.float16), color, look)
     cam, grain = gpu.denoised(rgb, noise)
-    return Full(np.ascontiguousarray(cam[..., :3]), grain)
+    return Full(np.ascontiguousarray(cam[..., :3]), grain, color, look)
 
 
 def develop(photo, data: bytes, settings: dict) -> np.ndarray:

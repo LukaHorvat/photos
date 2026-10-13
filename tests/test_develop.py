@@ -7,7 +7,7 @@ def test_full_tiles_cover_the_photo():
     h, w, T = 1100, 1300, develop.FULL_TILE
     rng = np.random.default_rng(0)
     cam, grain = rng.random((h, w, 3)).astype(np.float16), rng.random((h, w)).astype(np.float16)
-    full = develop.Full(cam, grain)
+    full = develop.Full(cam, grain, None, None)
     rebuilt_cam, rebuilt_grain = np.zeros_like(cam), np.zeros_like(grain)
     for j in range(-(-h // T)):
         for i in range(-(-w // T)):

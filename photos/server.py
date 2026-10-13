@@ -109,8 +109,9 @@ class Library:
         self.previews = Prefetcher(
             lambda key: develop.preview(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
-        # The editor's 100% view: ~200 MB and ~2 s of work each, so one at a time and few kept.
-        self.fulls = Prefetcher(lambda name: develop.full(self.photos[name], read_file(self.photos[name].path)), workers=1, keep=2)
+        # The export's input at full size, for the editor's noise-reduced views: ~200 MB and
+        # ~3 s of work each, so one at a time, and only the photo on screen and the next.
+        self.fulls = Prefetcher(lambda name: develop.full(self.photos[name], read_file(self.photos[name].path)), workers=1, keep=3)
         self.state_path = folder / STATE_FILE
         self.state = self._load()
         self._save_lock = threading.Lock()
@@ -284,12 +285,16 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "clip":
                 self.lib.clips.result(name)
                 return self._send([photo.clipping(w)], "image/png", cache=True)
+            if kind == "develop" and "nr" in query:
+                return self._send([develop.denoised_preview(self.lib.fulls.get(name).result(), preview_size(w))], "application/octet-stream")
             if kind == "develop":
                 data = self.lib.previews.result((name, preview_size(w)))
                 return self._send([data], "application/octet-stream")
             if kind == "full":
                 i, j = (int(v) for v in query["t"][0].split(","))
-                return self._send([self.lib.fulls.result(name).tile(i, j)], "application/octet-stream")
+                return self._send([self.lib.fulls.get(name).result().tile(i, j)], "application/octet-stream")
+        except CancelledError:  # the editor moved on while we waited (and won't read this)
+            return self.send_error(HTTPStatus.CONFLICT, "dropped")
         except ConnectionError:
             raise
         except Exception as e:
@@ -305,11 +310,10 @@ class Handler(BaseHTTPRequestHandler):
             self.lib.clips.want(raws)
             return self._json({"ok": True})
         if self.path == "/api/develop-hint":
+            # names[0] is on screen, then the next, then others nearby
             size = preview_size(int(body.get("w", 0)))
             self.lib.previews.want([(n, size) for n in raws])
-            return self._json({"ok": True})
-        if self.path == "/api/full-hint":
-            self.lib.fulls.want(raws)
+            self.lib.fulls.want(raws[:2])
             return self._json({"ok": True})
         if self.path == "/api/edit":
             name = body.get("name")

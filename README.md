@@ -41,11 +41,13 @@ itself; colour noise smoothed along brightness edges; then part of the removed
 grain given back, more at low ISO, as the camera keeps it. It runs on the GPU,
 about 0.3 s per photo in a batch.
 
-The whole-photo view is downsampled, so noise hardly shows and it skips noise
-reduction. `Z` (or a click) shows 100% at the cursor as the export will be: the
-server prepares the export's noise-reduced data (~3 s, started once you stay on a
-photo for a second, and for the next photo while zoomed) and sends it in tiles,
-which the same shader develops in the browser, so sliders stay instant.
+The editor shows what the export will be, noise reduction included. The server
+prepares the export's noise-reduced input at full size (~3 s per photo, for the
+photo on screen and then the next one, so at editing pace it's ready when you get
+there); until then a quick preview without noise reduction stands in ("Reducing
+noise…"). The browser develops a shrunk copy for the whole-photo view, and `Z` (or
+a click) shows 100% at the cursor from tiles of the full size, so sliders stay
+instant either way.
 
 Photos are grouped into series: a pause of more than 10 seconds between two
 consecutive shots starts a new one (`edits.SERIES_GAP`). A change applies to the

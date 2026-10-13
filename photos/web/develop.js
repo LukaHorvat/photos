@@ -26,6 +26,7 @@ function parsePreview(buffer) {
   info.coeffs = take(info.coeffWidth * info.coeffHeight * 2);
   info.tone = take(info.toneSize);
   info.table = take(info.tableSize[0] * info.tableSize[1] * info.tableSize[2] * 3);
+  info.grainData = info.grain ? take(info.width * info.height) : new Uint16Array(1);
   return info;
 }
 
@@ -58,8 +59,7 @@ class Developer {
     this.coeffTex = this.texture(1);
     this.toneTex = this.texture(2);
     this.colourTex = this.texture(3, gl.TEXTURE_3D);
-    this.grainTex = this.texture(4);  // the preview has no noise reduction: no grain to give back
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, 1, 1, 0, gl.RED, gl.HALF_FLOAT, new Uint16Array(1));
+    this.grainTex = this.texture(4);
     ['cam', 'coeffs', 'tone', 'colour', 'grain'].forEach((name, unit) => gl.uniform1i(gl.getUniformLocation(program, name), unit));
     this.info = null;
     this.full = null; // the 100% view's full-size camera RGB and grain (develop.Full), filled tile by tile
@@ -131,6 +131,11 @@ class Developer {
     gl.bindTexture(gl.TEXTURE_3D, this.colourTex);
     const [w, h, d] = info.tableSize;
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGB16F, w, h, d, 0, gl.RGB, gl.HALF_FLOAT, info.table);
+    // Grain comes with the noise-reduced preview; the quick one has none to give back.
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, this.grainTex);
+    const [gw, gh] = info.grain ? [info.width, info.height] : [1, 1];
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, gw, gh, 0, gl.RED, gl.HALF_FLOAT, info.grainData);
     this.info = info;
   }
 
