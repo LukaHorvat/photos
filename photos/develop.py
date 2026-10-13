@@ -30,17 +30,19 @@ from PIL import Image
 
 from .look import GRID, LUMA, Look, load_profile
 
-# temp None: as shot. noise None: automatic (denoise.active), else 0 off, 100 on.
-DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "saturation": 0, "contrast": 0, "noise": None}
+# temp None: as shot. tint 0: the camera's. noise None: automatic (denoise.active), else 0 off, 100 on.
+DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "tint": 0, "saturation": 0, "contrast": 0, "noise": None}
 LIMITS = {
     "compress": (0, 100),
     "exposure": (-4.0, 4.0),
     "temp": (2000, 15000),
+    "tint": (-100, 100),
     "saturation": (-100, 100),
     "contrast": (-100, 100),
     "noise": (0, 100),
 }
 TEMP_STEP = 50  # Kelvin; temperatures are kept on this grid, so the editor can be sent all of them
+TINT_STOPS = 1.0  # tint +100 / -100: red and blue this many stops up / down against green (magenta / green)
 
 MAX_COMPRESSION = 0.75  # at 100, the base layer keeps a quarter of its contrast
 LOG_FLOOR = 2.0**-12  # ~ the sensor's noise floor; darker than this is not lifted further
@@ -102,7 +104,7 @@ class Color:
     cam_xyz: np.ndarray  # XYZ -> camera RGB
     rgb_cam: np.ndarray  # white-balanced camera RGB -> linear sRGB
     as_shot: np.ndarray  # camera's multipliers, green = 1
-    tint: np.ndarray  # as_shot / temp_multipliers(as_shot_temp): the off-locus (green/magenta) part
+    off_locus: np.ndarray  # as_shot / temp_multipliers(as_shot_temp): the camera's own green/magenta
     as_shot_temp: float
 
     @classmethod
@@ -126,21 +128,33 @@ class Color:
             else:
                 hi = mid
         temp = 1e6 / ((lo + hi) / 2)
-        tint = as_shot / temp_multipliers(cam_xyz, temp)
-        return cls(cam_xyz, np.linalg.inv(cam_rgb), as_shot, tint / tint[1], temp)
+        off_locus = as_shot / temp_multipliers(cam_xyz, temp)
+        return cls(cam_xyz, np.linalg.inv(cam_rgb), as_shot, off_locus / off_locus[1], temp)
 
-    def multipliers(self, temp: float | None) -> np.ndarray:
-        if temp is None:
-            return self.as_shot
-        return temp_multipliers(self.cam_xyz, temp) * self.tint
+    def multipliers(self, temp: float | None, tint: float = 0) -> np.ndarray:
+        """White balance: a temperature (None: as shot; the camera's own tint kept), and tint on
+        top of it, which moves red and blue against green without changing brightness."""
+        base = self.as_shot if temp is None else temp_multipliers(self.cam_xyz, temp) * self.off_locus
+        f = 2.0 ** (tint / 100 * TINT_STOPS)
+        w = self.tint_weights
+        return base * np.array([f, 1.0, f]) / (w[0] * f + w[1] + w[2] * f)
+
+    @property
+    def tint_weights(self) -> np.ndarray:
+        """Luminance of each white-balanced camera channel (they sum to 1)."""
+        return self.rgb_cam.T @ LUMA
 
     def header(self) -> dict:
         lo, hi = LIMITS["temp"]
         return {
             "asShot": self.as_shot.tolist(),
             "asShotTemp": round(self.as_shot_temp),
-            # The multipliers for every temperature the editor can set, so it needn't compute them.
+            # The multipliers for every temperature the editor can set, so it needn't compute them;
+            # tint on top as in multipliers(), and the white balance pickers' maths (editor.js).
             "wb": {t: self.multipliers(t).tolist() for t in range(lo, hi + 1, TEMP_STEP)},
+            "tintStops": TINT_STOPS,
+            "tintWeights": self.tint_weights.tolist(),
+            "camRgb": np.linalg.inv(self.rgb_cam).tolist(),  # linear sRGB -> white-balanced camera RGB, rows
         }
 
 
@@ -182,7 +196,7 @@ def uniforms(color: Color, look: Look, settings: dict) -> dict:
     s = clean(settings)
     return {
         **base_uniforms(color, look),
-        "mul": color.multipliers(s["temp"]).tolist(),
+        "mul": color.multipliers(s["temp"], s["tint"]).tolist(),
         "compress": s["compress"],
         "exposure": s["exposure"],
         "saturation": s["saturation"],

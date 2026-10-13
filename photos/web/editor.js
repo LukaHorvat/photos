@@ -19,6 +19,7 @@ const ED = {
   pos: -1,
   live: null, // the current photo's settings, including a drag not saved yet
   before: false, // showing the photo without edits
+  picking: null, // a white balance picker waiting for a click: 'neutral' or 'skin'
   zoom: false, // 100% view: the full-size photo as an export will develop it, noise reduction included
   zx: 0.5, // its centre, as a fraction of the photo
   zy: 0.5,
@@ -94,6 +95,7 @@ function asShotTemp() {
 function formatValue(key, v) {
   if (key === 'exposure') return `${v > 0 ? '+' : ''}${v.toFixed(2)} EV`;
   if (key === 'saturation' || key === 'contrast') return `${v > 0 ? '+' : ''}${v}`;
+  if (key === 'tint') return v > 0 ? `+${v} magenta` : v < 0 ? `${v} green` : '0';
   if (key === 'temp') {
     const t = v ?? asShotTemp();
     return v == null ? (t ? `${t} K, as shot` : 'as shot') : `${v} K`;
@@ -271,8 +273,9 @@ function requestDraw() {
   }
   const loading = ED.view && visibleTiles().some((t) => !t.loaded);
   const finishing = ED.shownKey !== currentKey() && nrExpected(editCurrent(), ED.live?.noise);
-  $('#editnote').textContent = ED.before
-    ? 'Before'
+  $('#editnote').textContent = ED.picking
+    ? PICK_HINT[ED.picking]
+    : ED.before ? 'Before'
     : ED.shown !== editCurrent() ? 'Developing…'
     : loading ? 'Loading full size…'
     : finishing ? 'Reducing noise…' : '';
@@ -446,8 +449,130 @@ editView.addEventListener('pointermove', (e) => {
 editView.addEventListener('pointerup', (e) => {
   const d = editDrag;
   editDrag = null;
-  if (d && !d.moved) toggleEditZoom(e.clientX, e.clientY);
+  if (d && !d.moved) {
+    if (ED.picking) pickWhiteBalance(e.clientX, e.clientY);
+    else toggleEditZoom(e.clientX, e.clientY);
+  }
 });
+
+// --- White balance pickers ------------------------------------------------------------------
+// Click a spot; from its camera RGB (the preview's data): the temperature and tint that make
+// it neutral, or the tint that gives it skin's hue. Skin, in scene-linear sRGB as (log R/G,
+// log B/G), lies in one direction from grey on everyone (colour checker light and dark skin:
+// -28.1 and -28.7 degrees; clear skin on faces in Luka's photos under the camera's white
+// balance: -26 to -36, median -30), at a distance (saturation) that differs a lot. So skin
+// tells green from magenta, but not warm light from tanned skin: the skin picker leaves the
+// temperature alone.
+
+const SKIN_DIRECTION = (-29 * Math.PI) / 180;
+const PICK_HINT = {
+  neutral: 'Click something that should be grey or white',
+  skin: 'Click on skin: a cheek or forehead, not beard, lips or deep shadow',
+};
+
+function setPicking(kind) {
+  ED.picking = kind;
+  editView.classList.toggle('picking', !!kind);
+  for (const b of document.querySelectorAll('.pickers button')) b.classList.toggle('on', b.dataset.pick === kind);
+  requestDraw();
+}
+
+for (const b of document.querySelectorAll('.pickers button')) {
+  b.addEventListener('click', () => setPicking(ED.picking === b.dataset.pick ? null : b.dataset.pick));
+}
+
+function imageFraction(px, py) {
+  // Where on the photo a screen point is, as fractions of its width and height (or null).
+  let fx, fy;
+  if (ED.view) {
+    const sr = editView.getBoundingClientRect();
+    fx = (ED.view.x0 + (px - sr.left) * dpr()) / ED.view.width;
+    fy = (ED.view.y0 + (py - sr.top) * dpr()) / ED.view.height;
+  } else {
+    const r = editCanvas.getBoundingClientRect();
+    fx = (px - r.left) / r.width;
+    fy = (py - r.top) / r.height;
+  }
+  return fx >= 0 && fx < 1 && fy >= 0 && fy < 1 ? [fx, fy] : null;
+}
+
+function halfToFloat(h) {
+  const e = (h >> 10) & 31;
+  const m = h & 1023;
+  const v = e === 0 ? m * 2 ** -24 : e === 31 ? Infinity : (1 + m / 1024) * 2 ** (e - 15);
+  return h & 32768 ? -v : v;
+}
+
+function sampleCamera(fx, fy) {
+  // Median camera RGB (white balance not applied) of a small patch of the preview's data.
+  const { width: w, height: h, cam } = ED.dev.info;
+  const r = Math.max(2, Math.round(w / 300));
+  const cx = Math.floor(fx * w);
+  const cy = Math.floor(fy * h);
+  const channels = [[], [], []];
+  for (let y = Math.max(0, cy - r); y <= Math.min(h - 1, cy + r); y++) {
+    for (let x = Math.max(0, cx - r); x <= Math.min(w - 1, cx + r); x++) {
+      for (let c = 0; c < 3; c++) channels[c].push(halfToFloat(cam[(y * w + x) * 3 + c]));
+    }
+  }
+  const median = (a) => a.sort((p, q) => p - q)[a.length >> 1];
+  const clipped = channels.some((a) => a.filter((v) => v > 0.97).length > a.length / 4);
+  return { rgb: channels.map(median), clipped };
+}
+
+function solveWhiteBalance(mul) {
+  // Multipliers (any scale) -> the temperature and tint closest to them.
+  const info = ED.dev.info;
+  const target = Math.log(mul[0] / mul[2]); // tint scales red and blue alike: only temperature moves this
+  let temp = null;
+  let best = Infinity;
+  for (const [t, m] of Object.entries(info.wb)) {
+    const err = Math.abs(Math.log(m[0] / m[2]) - target);
+    if (err < best) [temp, best] = [Number(t), err];
+  }
+  const m = info.wb[temp];
+  const s = (Math.log(mul[0] / mul[1] / m[0]) + Math.log(mul[2] / mul[1] / m[2])) / 2; // m has green = 1
+  const tint = Math.round((s / Math.LN2 / info.tintStops) * 100);
+  const [lo, hi] = ED.limits.tint;
+  return { temp, tint: Math.min(hi, Math.max(lo, tint)) || 0, beyond: best > 0.02 || tint < lo || tint > hi };
+}
+
+function skinTint(cam) {
+  // The tint, at this temperature, that puts the spot's colour in skin's direction.
+  const info = ED.dev.info;
+  const rgbCam = info.uniforms.rgbCam; // column-major
+  const [lo, hi] = ED.limits.tint;
+  let best = { error: Infinity };
+  for (let tint = lo; tint <= hi; tint++) {
+    const mul = whiteBalance(info, ED.live.temp, tint);
+    const wb = cam.map((v, c) => v * mul[c]);
+    const scene = [0, 1, 2].map((i) => [0, 1, 2].reduce((sum, j) => sum + rgbCam[j * 3 + i] * wb[j], 0));
+    if (Math.min(...scene) <= 0) continue;
+    const u = Math.log(scene[0] / scene[1]);
+    const v = Math.log(scene[2] / scene[1]);
+    if (Math.hypot(u, v) < 0.15) continue; // nearly grey: not skin at this tint
+    const error = Math.abs(Math.atan2(v, u) - SKIN_DIRECTION);
+    if (error < best.error) best = { error, tint };
+  }
+  if (best.tint === undefined || best.error > Math.PI / 4) return {};
+  return { temp: ED.live.temp, tint: best.tint, beyond: best.error > (5 * Math.PI) / 180 };
+}
+
+function pickWhiteBalance(px, py) {
+  const kind = ED.picking;
+  const at = ED.dev && ED.shown === editCurrent() && ED.live && imageFraction(px, py);
+  if (!at) return;
+  const { rgb: cam, clipped } = sampleCamera(...at);
+  if (clipped) return toast("That spot is blown out: pick one that isn't pure white", true);
+  if (Math.min(...cam) <= 1e-4) return toast('That spot is too dark to judge: pick a brighter one', true);
+  const { temp, tint, beyond } = kind === 'neutral' ? solveWhiteBalance(cam.map((v) => 1 / v)) : skinTint(cam);
+  if (temp === undefined) return toast("That doesn't look like skin: pick a cheek or forehead", true);
+  setPicking(null);
+  setSettings({ ...ED.live, temp, tint });
+  const what = kind === 'neutral' ? `White balance from the neutral: ${temp} K, tint` : 'Tint from skin:';
+  toast(`${what} ${formatValue('tint', tint)}${beyond ? ' (as far as the slider goes)' : ''}`, beyond);
+}
+
 
 editView.addEventListener('pointerleave', () => { if (!editDrag) editPointer = null; });
 
@@ -710,8 +835,15 @@ function editorKey(e, k) {
     case 'z':
       toggleEditZoom(editPointer?.x, editPointer?.y);
       return true;
+    case 'w': {
+      const kind = e.shiftKey ? 'skin' : 'neutral';
+      setPicking(ED.picking === kind ? null : kind);
+      return true;
+    }
     case 'Escape':
-      if (ED.before) {
+      if (ED.picking) {
+        setPicking(null);
+      } else if (ED.before) {
         ED.before = false;
         requestDraw();
       } else if (ED.zoom) {

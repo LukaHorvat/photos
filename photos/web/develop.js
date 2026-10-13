@@ -30,6 +30,16 @@ function parsePreview(buffer) {
   return info;
 }
 
+function whiteBalance(info, temp, tint) {
+  // develop.Color.multipliers: the temperature's (or as shot), then tint moves red and blue
+  // against green, brightness kept.
+  const base = temp == null ? info.asShot : info.wb[temp];
+  const f = 2 ** (((tint ?? 0) / 100) * info.tintStops);
+  const [wr, wg, wb] = info.tintWeights;
+  const k = wr * f + wg + wb * f;
+  return [(base[0] * f) / k, base[1] / k, (base[2] * f) / k];
+}
+
 class Developer {
   constructor(canvas, shaders) {
     this.canvas = canvas;
@@ -160,7 +170,7 @@ class Developer {
     if (!info) return;
     this.set({
       ...info.uniforms,
-      mul: settings.temp == null ? info.asShot : info.wb[settings.temp],
+      mul: whiteBalance(info, settings.temp, settings.tint),
       compress: settings.compress,
       exposure: settings.exposure,
       saturation: settings.saturation,

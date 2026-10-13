@@ -62,6 +62,14 @@
           <span class="sname">Temperature</span><span class="sval"></span>
           <input type="range" min="0" max="1000" step="1">
         </label>
+        <label class="slider" data-key="tint">
+          <span class="sname">Tint</span><span class="sval"></span>
+          <input type="range" min="-100" max="100" step="1">
+        </label>
+        <div class="pickers">
+          <button class="chip" data-pick="neutral" title="Click something that should be grey or white (W)">Pick neutral</button>
+          <button class="chip" data-pick="skin" title="Click on skin: sets the tint so it has skin's hue; temperature stays (Shift W)">Pick skin</button>
+        </div>
         <label class="slider" data-key="contrast">
           <span class="sname">Contrast</span><span class="sval"></span>
           <input type="range" min="-100" max="100" step="1">
@@ -114,10 +122,13 @@
       <tr><td><kbd>Z</kbd> or click</td><td>100% at the cursor, as the export will be, noise reduction included; drag to pan.
         Stays on while you browse</td></tr>
       <tr><td><kbd>\</kbd></td><td>before / after: the photo without edits</td></tr>
+      <tr><td><kbd>W</kbd> / <kbd>Shift</kbd> <kbd>W</kbd></td><td>white balance from a click on something grey or white /
+        on skin (a cheek or forehead, not beard, lips or deep shadow): skin's hue is about the same on everyone, so it
+        sets only the tint (green / magenta): it can't tell warm light from tanned skin</td></tr>
       <tr><td>double-click a slider</td><td>reset it</td></tr>
       <tr><td><kbd>Ctrl</kbd> <kbd>C</kbd> / <kbd>Ctrl</kbd> <kbd>V</kbd></td><td>copy this photo's settings / paste them onto
         another (and, like any change, the rest of its series)</td></tr>
-      <tr><td><kbd>Esc</kbd></td><td>leave before / after, then 100%</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>leave a picker, before / after, then 100%</td></tr>
       <tr><td><kbd>E</kbd></td><td>back to picking (rejected and unmarked photos are there)</td></tr>
     </table>
     <p class="edit-only">Photos are grouped into series: a pause of more than 10 seconds between two shots starts a new

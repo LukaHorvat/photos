@@ -21,7 +21,10 @@ all four photosites of a Bayer block at the black level.
 ## Edit
 
 Develops the kept photos: dynamic range compression, exposure (applied after
-compression), colour temperature, contrast and saturation. One shader
+compression), white balance (temperature, and tint: green to magenta), contrast and
+saturation. Two pickers set white balance from a click: `W` on something that should
+be grey or white, `Shift W` on skin, which sets only the tint: skin's hue is about
+the same on everyone, its warmth and saturation aren't. One shader
 (`web/develop.frag`) does it, in the browser for the preview, so sliders respond
 instantly, and on the server's GPU for exports, so an export is what the editor
 showed.

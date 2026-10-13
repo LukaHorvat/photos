@@ -257,6 +257,14 @@ body.mode-edit .cull-only { display: none !important; }
   border-radius: 3px;
   height: 6px;
 }
+.slider[data-key="tint"] input {
+  accent-color: #c8c8c8;
+  background: linear-gradient(90deg, #58b058, #d8d8d8 50%, #c858c0);
+  border-radius: 3px;
+  height: 6px;
+}
+.pickers { display: flex; gap: 6px; margin: -6px 0 16px; }
+#editview.picking, #editview.picking.zoomed { cursor: crosshair; }
 .toggle { display: grid; grid-template-columns: 1fr auto; row-gap: 6px; margin-bottom: 16px; }
 .toggle .sval { color: var(--hi); }
 .toggle .sval.default { color: var(--dim); }
