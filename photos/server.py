@@ -107,7 +107,7 @@ class Library:
         self.names = list(self.photos)
         self.clips = Prefetcher(lambda name: self.photos[name].clipping_mask(), workers=6, keep=10**6)
         self.previews = Prefetcher(
-            lambda key: develop.preview(read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
+            lambda key: develop.preview(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
         self.state_path = folder / STATE_FILE
         self.state = self._load()

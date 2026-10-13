@@ -21,11 +21,19 @@ all four photosites of a Bayer block at the black level.
 ## Edit
 
 Develops the kept photos: dynamic range compression, exposure (applied after
-compression), colour temperature and saturation. The preview is rendered by a
-WebGL shader in the browser (`web/develop.js`) from linear raw data the server
-prepares once per photo, so sliders respond instantly; exports run the same
-pipeline in numpy (`develop.py`) at full resolution. The default rendering's
-tone curve is fitted to the camera's own JPEGs (`scripts/calibrate_curve.py`).
+compression), colour temperature, contrast and saturation. One shader
+(`web/develop.frag`) does it, in the browser for the preview, so sliders respond
+instantly, and on the server's GPU for exports, so an export is what the editor
+showed.
+
+Unedited, a photo looks like the camera's own JPEG (`look.py`): its tone curve is
+fitted to the JPEG embedded in that raw (the camera adapts it per scene), and
+colour comes from a profile per camera model in `photos/profiles/`, fitted from
+raw + JPEG pairs:
+
+```sh
+uv run python scripts/calibrate_camera.py /mnt/d/Radno
+```
 
 Photos are grouped into series: a pause of more than 10 seconds between two
 consecutive shots starts a new one (`edits.SERIES_GAP`). A change applies to the

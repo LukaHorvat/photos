@@ -85,7 +85,7 @@ function asShotTemp() {
 
 function formatValue(key, v) {
   if (key === 'exposure') return `${v > 0 ? '+' : ''}${v.toFixed(2)} EV`;
-  if (key === 'saturation') return `${v > 0 ? '+' : ''}${v}`;
+  if (key === 'saturation' || key === 'contrast') return `${v > 0 ? '+' : ''}${v}`;
   if (key === 'temp') {
     const t = v ?? asShotTemp();
     return v == null ? (t ? `${t} K, as shot` : 'as shot') : `${v} K`;

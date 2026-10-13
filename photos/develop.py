@@ -12,7 +12,8 @@ The pipeline, in order:
      of log luminance is reduced around mid-grey; local detail is kept as it is
   4. exposure (EV), after compression
   5. saturation
-  6. base tone curve, fitted to the camera's own JPEGs, then sRGB encoding
+  6. the camera's look (look.py): this photo's tone curve, fitted to its camera JPEG,
+     then contrast, then the camera's colour profile; then sRGB encoding
 """
 
 from __future__ import annotations
@@ -24,18 +25,18 @@ import numpy as np
 import rawpy
 from PIL import Image
 
-DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "saturation": 0}
-LIMITS = {"compress": (0, 100), "exposure": (-4.0, 4.0), "temp": (2000, 15000), "saturation": (-100, 100)}
+from .look import GRID, LUMA, Look
+
+DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "saturation": 0, "contrast": 0}
+LIMITS = {
+    "compress": (0, 100),
+    "exposure": (-4.0, 4.0),
+    "temp": (2000, 15000),
+    "saturation": (-100, 100),
+    "contrast": (-100, 100),
+}
 TEMP_STEP = 50  # Kelvin; temperatures are kept on this grid, so the editor can be sent all of them
 
-# Base tone curve y = (1 + K) t^C / (t^C + K), t = GAIN * x, clipped to 1. Fitted by
-# histogram matching against D3500 JPEGs (scripts/calibrate_curve.py).
-CURVE_GAIN = 0.596
-CURVE_C = 1.650
-CURVE_K = 0.029
-
-# Scene-linear value the curve turns into display mid-grey (0.18); compression pivots here.
-ANCHOR = float(np.log2((0.18 * CURVE_K / (1 + CURVE_K - 0.18)) ** (1 / CURVE_C) / CURVE_GAIN))
 MAX_COMPRESSION = 0.75  # at 100, the base layer keeps a quarter of its contrast
 LOG_FLOOR = 2.0**-12  # ~ the sensor's noise floor; darker than this is not lifted further
 
@@ -45,7 +46,6 @@ BASE_LONG_SIDE = 512
 BASE_RADIUS = 20  # pixels at BASE_LONG_SIDE
 BASE_EPS = 0.3  # log2 units squared; edges stronger than ~0.5 stop are kept
 
-LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 SRGB_TO_XYZ = np.array(
     [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]]
 )
@@ -158,27 +158,36 @@ def clean(settings: dict | None) -> dict:
     return out
 
 
-def base_uniforms(color: Color) -> dict:
+def base_uniforms(color: Color, look: Look) -> dict:
     """The shader inputs that are fixed for a photo (see develop.frag)."""
     return {
         "rgbCam": color.rgb_cam.T.flatten().tolist(),  # GL matrices are column-major
         "maxCompression": MAX_COMPRESSION,
-        "anchor": ANCHOR,
+        "anchor": look.anchor,
         "logFloor": LOG_FLOOR,
-        "curve": [CURVE_GAIN, CURVE_C, CURVE_K],
+        "toneRange": [float(GRID[0]), float(GRID[-1])],
+        "toneSize": float(GRID.size),
+        "shadowLoss": look.shadow_loss,
     }
 
 
-def uniforms(color: Color, settings: dict) -> dict:
+def uniforms(color: Color, look: Look, settings: dict) -> dict:
     """All shader inputs for these settings. web/develop.js sets the same ones."""
     s = clean(settings)
     return {
-        **base_uniforms(color),
+        **base_uniforms(color, look),
         "mul": color.multipliers(s["temp"]).tolist(),
         "compress": s["compress"],
         "exposure": s["exposure"],
         "saturation": s["saturation"],
+        "contrast": s["contrast"],
     }
+
+
+def look_textures(look: Look) -> tuple[np.ndarray, np.ndarray]:
+    """The look's lookup textures: tone curve (n,), colour table as depth x height x width x 3
+    (level, b - g, r - g), the order a GL 3D texture is uploaded in."""
+    return look.tone.astype(np.float32), np.ascontiguousarray(look.table.transpose(2, 1, 0, 3), np.float32)
 
 
 def base_coefficients(rgb_cam: np.ndarray, color: Color) -> np.ndarray:
@@ -247,15 +256,26 @@ def decode(data: bytes, half_size: bool) -> tuple[np.ndarray, Color]:
     return rgb, color
 
 
-def preview(data: bytes, long_side: int) -> bytes:
+_looks: dict = {}  # path -> Look: fitted for the editor's preview, reused by the export
+
+
+def look_for(photo, data: bytes, rgb: np.ndarray, color: Color) -> Look:
+    look = _looks.get(photo.path)
+    if look is None:
+        look = _looks[photo.path] = Look.for_photo(rgb, color, photo.embedded_jpeg(data), photo.camera, photo.iso)
+    return look
+
+
+def preview(photo, data: bytes, long_side: int) -> bytes:
     """Everything the browser needs to develop this photo itself, as one binary blob:
 
     uint32 header length, JSON header, padding to 2 bytes, then float16 camera RGB
-    (height x width x 3) and float16 base coefficients (ch x cw x 2).
+    (height x width x 3), base coefficients (ch x cw x 2), tone curve and colour table.
     """
     import json
 
     rgb, color = decode(data, half_size=True)
+    look = look_for(photo, data, rgb, color)
     h, w = rgb.shape[:2]
     scale = min(1.0, long_side / max(h, w))
     if scale < 1:
@@ -265,30 +285,30 @@ def preview(data: bytes, long_side: int) -> bytes:
         )
         h, w = rgb.shape[:2]
     coeffs = base_coefficients(rgb, color)
+    tone, table = look_textures(look)
     header = {
         "width": w,
         "height": h,
         "coeffWidth": coeffs.shape[1],
         "coeffHeight": coeffs.shape[0],
-        "uniforms": base_uniforms(color),
+        "toneSize": tone.size,
+        "tableSize": [table.shape[2], table.shape[1], table.shape[0]],  # width, height, depth
+        "uniforms": base_uniforms(color, look),
         **color.header(),
     }
     head = json.dumps(header).encode()
     head += b" " * (len(head) % 2)
     return b"".join(
-        [
-            len(head).to_bytes(4, "little"),
-            head,
-            rgb.astype(np.float16).tobytes(),
-            coeffs.astype(np.float16).tobytes(),
-        ]
+        [len(head).to_bytes(4, "little"), head]
+        + [a.astype(np.float16).tobytes() for a in (rgb, coeffs, tone, table)]
     )
 
 
-def develop(data: bytes, settings: dict, half_size: bool = False) -> np.ndarray:
-    """A whole raw file, developed -> sRGB uint8 (HxWx3)."""
+def develop(photo, data: bytes, settings: dict) -> np.ndarray:
+    """A whole raw file, developed at full size -> sRGB uint8 (HxWx3)."""
     from . import gpu
 
-    rgb, color = decode(data, half_size)
+    rgb, color = decode(data, half_size=False)
+    look = look_for(photo, data, rgb, color)
     coeffs = base_coefficients(rgb, color)
-    return gpu.render(rgb, coeffs, uniforms(color, settings))
+    return gpu.render(rgb, coeffs, uniforms(color, look, settings), *look_textures(look))

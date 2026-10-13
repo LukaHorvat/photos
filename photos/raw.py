@@ -366,6 +366,33 @@ class Photo:
             self._clip = _mask_png(im)
         return self._clip
 
+    def embedded_jpeg(self, data: bytes | None = None) -> bytes | None:
+        """The largest embedded JPEG with this photo's orientation tagged, cut from `data` (the
+        whole file) if given; None if there is none."""
+        info = self.info
+        if not self.is_raw or not info.jpegs:
+            return None
+        j = info.jpegs[-1]
+        if data is not None:
+            blob = data[j.offset : j.offset + j.length]
+        else:
+            with open(self.path, "rb") as f:
+                f.seek(j.offset)
+                blob = f.read(j.length)
+        if info.orientation in (0, 1):
+            return blob
+        return blob[:2] + orientation_app1(info.orientation) + blob[2:]
+
+    @property
+    def camera(self) -> str | None:
+        """Camera model, e.g. "NIKON D3500": which colour profile to use."""
+        model = self.info.tags.get("ifd0", {}).get(0x0110)
+        return model.strip() if isinstance(model, str) else None
+
+    @property
+    def iso(self) -> int | None:
+        return self.info.exif.get("iso")
+
     def size(self) -> tuple[int, int] | None:
         """Displayed (width, height) of the largest image, after orientation."""
         info = self.info
