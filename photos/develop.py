@@ -14,6 +14,9 @@ The pipeline, in order:
   5. saturation
   6. the camera's look (look.py): this photo's tone curve, fitted to its camera JPEG,
      then contrast, then the camera's colour profile; then sRGB encoding
+
+Exports also get noise reduction (denoise.py): on the raw data before demosaicing, then
+colour noise in gpu.py before the shader, which adds back some grain at step 2.
 """
 
 from __future__ import annotations
@@ -241,19 +244,40 @@ def decode(data: bytes, half_size: bool) -> tuple[np.ndarray, Color]:
     Noise below the black level is kept (as negative values): LibRaw is given a black
     level BLACK_PAD lower than the real one, and the difference is subtracted here.
     """
+    rgb, color, _ = _decode(data, half_size, denoise=False)
+    return rgb, color
+
+
+def decode_denoised(data: bytes, iso: int | None):
+    """decode() at full size, with noise reduction on the raw data before demosaicing
+    (denoise.py); also returns what the develop step needs to finish it (or None if the
+    sensor isn't a Bayer one)."""
+    return _decode(data, False, denoise=True, iso=iso)
+
+
+def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None):
+    from . import denoise as dn
+
+    removed = None
     with rawpy.imread(io.BytesIO(data)) as raw:
         color = Color.from_raw(raw)
         black = min(raw.black_level_per_channel)
         # Lossy NEFs saturate a few codes under the nominal white level (see raw.Photo.clipping_mask).
         top = int(raw.raw_image_visible.max())
         saturation = top if top >= 0.98 * raw.white_level else raw.white_level
+        if denoise and dn.supported(raw):
+            removed = dn.raw_nlm(raw, black, 1 / (saturation - black), color)
+            flip = raw.sizes.flip
         pad = min(black, BLACK_PAD)
         rgb = raw.postprocess(half_size=half_size, user_black=black - pad, user_sat=saturation, **RAW_LINEAR)
     # LibRaw outputs (raw - user_black) * 65535 / user_sat.
     rgb = rgb.astype(np.float32)
     rgb *= np.float32(saturation / 65535 / (saturation - black))
     rgb -= np.float32(pad / (saturation - black))
-    return rgb, color
+    noise = None
+    if removed is not None:
+        noise = dn.Noise(dn.orient(removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(iso))
+    return rgb, color, noise
 
 
 _looks: dict = {}  # path -> Look: fitted for the editor's preview, reused by the export
@@ -308,7 +332,7 @@ def develop(photo, data: bytes, settings: dict) -> np.ndarray:
     """A whole raw file, developed at full size -> sRGB uint8 (HxWx3)."""
     from . import gpu
 
-    rgb, color = decode(data, half_size=False)
+    rgb, color, noise = decode_denoised(data, photo.iso)
     look = look_for(photo, data, rgb, color)
     coeffs = base_coefficients(rgb, color)
-    return gpu.render(rgb, coeffs, uniforms(color, look, settings), *look_textures(look))
+    return gpu.render(rgb, coeffs, uniforms(color, look, settings), *look_textures(look), noise=noise)

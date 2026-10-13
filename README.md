@@ -35,6 +35,13 @@ raw + JPEG pairs:
 uv run python scripts/calibrate_camera.py /mnt/d/Radno
 ```
 
+Exports also get noise reduction like the camera's (`denoise.py`; not in the
+preview, which is downsampled, so noise hardly shows there): non-local means on
+the raw data before demosaicing, using the noise measured in each photo itself;
+colour noise smoothed along brightness edges; then part of the removed grain
+given back, more at low ISO, as the camera keeps it. It runs on the GPU, about
+0.3 s per photo in a batch.
+
 Photos are grouped into series: a pause of more than 10 seconds between two
 consecutive shots starts a new one (`edits.SERIES_GAP`). A change applies to the
 photo and the following ones of its series; changing a photo that isn't the first

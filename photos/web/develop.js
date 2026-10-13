@@ -58,7 +58,9 @@ class Developer {
     this.coeffTex = this.texture(1);
     this.toneTex = this.texture(2);
     this.colourTex = this.texture(3, gl.TEXTURE_3D);
-    ['cam', 'coeffs', 'tone', 'colour'].forEach((name, unit) => gl.uniform1i(gl.getUniformLocation(program, name), unit));
+    this.grainTex = this.texture(4);  // the preview has no noise reduction: no grain to give back
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, 1, 1, 0, gl.RED, gl.HALF_FLOAT, new Uint16Array(1));
+    ['cam', 'coeffs', 'tone', 'colour', 'grain'].forEach((name, unit) => gl.uniform1i(gl.getUniformLocation(program, name), unit));
     this.info = null;
   }
 

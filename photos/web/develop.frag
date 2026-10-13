@@ -12,6 +12,7 @@ uniform sampler2D cam;        // linear camera RGB, black 0, sensor saturation 1
 uniform sampler2D coeffs;     // base layer = a * log2(luminance) + b
 uniform sampler2D tone;       // this photo's tone curve: output luminance at even steps of log2 scene luminance
 uniform sampler3D colour;     // camera colour profile: output colour (at luminance 1) by chromaticity and brightness
+uniform sampler2D grain;      // exports only: luminance noise given back after noise reduction (denoise.py)
 uniform vec3 mul;             // white balance multipliers for the chosen temperature
 uniform mat3 rgbCam;          // camera RGB -> linear sRGB
 uniform float compress;       // dynamic range compression slider, 0..100
@@ -65,8 +66,8 @@ void main() {
   // clipping them earlier would bias the shadows, purple once red and blue are scaled up.
   float clipLevel = min(mul.r, min(mul.g, mul.b));
   vec3 rgb = min(texture(cam, uv).rgb * mul, vec3(clipLevel));
-  // 2. Camera RGB -> linear sRGB.
-  rgb = rgbCam * rgb;
+  // 2. Camera RGB -> linear sRGB, plus the grain noise reduction gives back.
+  rgb = rgbCam * rgb + texture(grain, uv).r;
   // 3. Dynamic range compression: shrink the base layer's contrast around mid-grey,
   // keeping the detail on top of it.
   float strength = compress / 100.0 * maxCompression;
