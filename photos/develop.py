@@ -22,21 +22,23 @@ colour noise in gpu.py before the shader, which adds back some grain at step 2.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import rawpy
 from PIL import Image
 
-from .look import GRID, LUMA, Look
+from .look import GRID, LUMA, Look, load_profile
 
-DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "saturation": 0, "contrast": 0}
+# temp None: as shot. noise None: automatic (denoise.active), else 0 off, 100 on.
+DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "saturation": 0, "contrast": 0, "noise": None}
 LIMITS = {
     "compress": (0, 100),
     "exposure": (-4.0, 4.0),
     "temp": (2000, 15000),
     "saturation": (-100, 100),
     "contrast": (-100, 100),
+    "noise": (0, 100),
 }
 TEMP_STEP = 50  # Kelvin; temperatures are kept on this grid, so the editor can be sent all of them
 
@@ -149,7 +151,7 @@ def clean(settings: dict | None) -> dict:
     """Settings with every field present, of the right type and within range."""
     out = dict(DEFAULTS)
     for key, value in (settings or {}).items():
-        if key not in DEFAULTS or (value is None and key == "temp"):
+        if key not in DEFAULTS or (value is None and DEFAULTS[key] is None):
             continue
         lo, hi = LIMITS[key]
         value = min(max(float(value), lo), hi)
@@ -249,15 +251,16 @@ def decode(data: bytes, half_size: bool) -> tuple[np.ndarray, Color]:
     return rgb, color
 
 
-def decode_denoised(data: bytes, iso: int | None):
-    """decode() at full size, with noise reduction on the raw data before demosaicing
-    (denoise.py); also returns what the develop step needs to finish it (or None if the
-    sensor isn't a Bayer one)."""
-    rgb, color, noise, _ = _decode(data, False, denoise=True, iso=iso)
+def decode_full(data: bytes, photo, denoise: bool):
+    """decode() at full size; with `denoise`, noise reduction on the raw data before
+    demosaicing (denoise.py). Also returns what the develop step needs to finish noise
+    reduction (or None)."""
+    typical = load_profile(photo.camera).noise_at(photo.iso) if denoise else None
+    rgb, color, noise, _ = _decode(data, False, denoise, photo.iso, typical)
     return rgb, color, noise
 
 
-def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None):
+def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None, typical_noise=None):
     """decode(), plus the noise reduction's leftovers and the full-size (width, height)."""
     from . import denoise as dn
 
@@ -272,7 +275,7 @@ def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None)
         saturation = top if top >= 0.98 * raw.white_level else raw.white_level
         gain = 1  # raw values are this many times larger after noise reduction
         if denoise and dn.supported(raw):
-            removed, gain = dn.raw_nlm(raw, black, 1 / (saturation - black), color)
+            removed, gain = dn.raw_nlm(raw, black, 1 / (saturation - black), color, typical_noise)
             flip = raw.sizes.flip
         pad = min(black, BLACK_PAD)
         rgb = raw.postprocess(half_size=half_size, user_black=gain * (black - pad), user_sat=gain * saturation, **RAW_LINEAR)
@@ -304,17 +307,25 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
     with header["grain"] the grain to give back (height x width).
 
     This is the quick one, from a half-size decode without noise reduction (~0.5 s);
-    denoised_preview() is what an export will be, shrunk.
+    full_preview() is what an export will be, shrunk.
     """
     rgb, color, _, full_size = _decode(data, half_size=True, denoise=False)
     look = look_for(photo, data, rgb, color)
     return _preview_blob(_shrink(rgb, long_side), None, color, look, full_size)
 
 
-def denoised_preview(full: "Full", long_side: int) -> bytes:
-    """preview() made from the export's own input, noise reduction included."""
-    h, w = full.cam.shape[:2]
-    return _preview_blob(_shrink(full.cam, long_side), _shrink(full.grain, long_side), full.color, full.look, (w, h))
+def full_preview(full: "Full", long_side: int) -> bytes:
+    """preview() made from the export's own input (noise reduction included, if it has any)."""
+    if long_side not in full.previews:
+        from concurrent.futures import ThreadPoolExecutor
+
+        h, w = full.cam.shape[:2]
+        planes = [full.cam[..., c] for c in range(3)] + ([] if full.grain is None else [full.grain])
+        with ThreadPoolExecutor(len(planes)) as ex:  # PIL and numpy let go of the GIL: ~4x faster
+            small = list(ex.map(lambda plane: _shrink(plane, long_side), planes))
+        grain = small[3] if len(small) > 3 else None
+        full.previews[long_side] = _preview_blob(np.stack(small[:3], -1), grain, full.color, full.look, (w, h))
+    return full.previews[long_side]
 
 
 def _shrink(img: np.ndarray, long_side: int) -> np.ndarray:
@@ -357,37 +368,40 @@ def _preview_blob(rgb, grain, color: Color, look: Look, full_size) -> bytes:
 @dataclass
 class Full:
     """What an export feeds the develop shader, at full size, for the editor: its 100% view
-    (in tiles) and its noise-reduced whole-photo view (denoised_preview). The browser runs
-    the shader on it, so both show what the export will."""
+    (in tiles) and its final whole-photo view (full_preview). The browser runs the shader on
+    it, so both show what the export will."""
 
-    cam: np.ndarray  # camera RGB after noise reduction, H x W x 3 float16
-    grain: np.ndarray  # grain given back, H x W float16
+    cam: np.ndarray  # camera RGB (after noise reduction, if any), H x W x 3 float16
+    grain: np.ndarray | None  # grain given back after noise reduction, H x W float16
     color: Color
     look: Look
+    previews: dict = field(default_factory=dict)  # long side -> full_preview()
 
     def tile(self, i: int, j: int) -> bytes:
         """Tile (column i, row j) of FULL_TILE squares, smaller at the right and bottom edges:
         its camera RGB, then its grain."""
         rows, cols = slice(j * FULL_TILE, (j + 1) * FULL_TILE), slice(i * FULL_TILE, (i + 1) * FULL_TILE)
-        return self.cam[rows, cols].tobytes() + self.grain[rows, cols].tobytes()
+        cam = self.cam[rows, cols]
+        grain = np.zeros(cam.shape[:2], np.float16) if self.grain is None else self.grain[rows, cols]
+        return cam.tobytes() + grain.tobytes()
 
 
-def full(photo, data: bytes) -> Full:
+def full(photo, data: bytes, denoise: bool) -> Full:
     from . import gpu
 
-    rgb, color, noise = decode_denoised(data, photo.iso)
+    rgb, color, noise = decode_full(data, photo, denoise)
     look = look_for(photo, data, rgb, color)
     if noise is None:
-        return Full(rgb.astype(np.float16), np.zeros(rgb.shape[:2], np.float16), color, look)
+        return Full(rgb.astype(np.float16), None, color, look)
     cam, grain = gpu.denoised(rgb, noise)
     return Full(np.ascontiguousarray(cam[..., :3]), grain, color, look)
 
 
 def develop(photo, data: bytes, settings: dict) -> np.ndarray:
     """A whole raw file, developed at full size -> sRGB uint8 (HxWx3)."""
-    from . import gpu
+    from . import denoise, gpu
 
-    rgb, color, noise = decode_denoised(data, photo.iso)
+    rgb, color, noise = decode_full(data, photo, denoise.active(clean(settings)["noise"], photo.iso))
     look = look_for(photo, data, rgb, color)
     coeffs = base_coefficients(rgb, color)
     return gpu.render(rgb, coeffs, uniforms(color, look, settings), *look_textures(look), noise=noise)

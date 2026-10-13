@@ -100,3 +100,30 @@ def test_render_with_noise_reduction(gpu):
     first, again = gpu.render(*args, noise=with_grain), gpu.render(*args, noise=with_grain)
     assert np.array_equal(first, again)  # pooled textures are reused cleanly
     assert np.abs(first.astype(int) - after).mean() > 1  # grain given back
+
+
+def test_texture_doesnt_pass_for_noise():
+    typical, level = (0.5, 0.2), 700
+    assert denoise.trusted((0.6, 10.0), typical, level) == (0.6, 10.0)  # a bit noisier than typical: as measured
+    assert denoise.trusted((4.5, 500.0), typical, level) == typical  # 10x: foliage, not noise (DSC_9331)
+
+
+def test_automatic_noise_reduction_follows_iso():
+    assert not denoise.active(None, 200) and denoise.active(None, denoise.AUTO_ISO) and denoise.active(None, 6400)
+    assert not denoise.active(None, None)  # no ISO to judge by
+    assert denoise.active(100, 200) and not denoise.active(0, 6400)  # the photo's setting wins
+
+
+def test_noise_setting_is_automatic_unless_set():
+    assert develop.clean({})["noise"] is None and develop.clean({"noise": None})["noise"] is None
+    assert develop.clean({"noise": 100})["noise"] == 100 and develop.clean({"noise": 250})["noise"] == 100
+
+
+def test_camera_noise_profile_round_trip(tmp_path):
+    profile = look.Profile(look.identity_table(), noise=(0.06, 0.0013, 8e-6))
+    profile.save(tmp_path / "cam.npz")
+    with np.load(tmp_path / "cam.npz") as f:
+        assert tuple(f["noise"]) == profile.noise
+    A, B = profile.noise_at(400)
+    assert A == pytest.approx(0.06 + 0.0013 * 400) and B == pytest.approx(8e-6 * 400**2)
+    assert look.Profile(look.identity_table()).noise_at(400) is None

@@ -23,12 +23,13 @@ const ED = {
   zx: 0.5, // its centre, as a fraction of the photo
   zy: 0.5,
   view: null, // where the full-size photo sits on the canvas, while zoomed (see Developer.draw)
-  full: { name: null, loaded: new Map(), pending: new Map(), queue: [] }, // full-size tiles of a photo
+  full: { key: null, loaded: new Map(), pending: new Map(), queue: [] }, // full-size tiles of a photo
   dev: null,
   shown: null, // name of the photo whose data is on the GPU
-  shownDenoised: false, // whether that's the noise-reduced preview yet
+  shownKey: null, // which data that is: finalKey(), or the quick preview's
   previews: new Map(), // name -> { promise, abort, info }: quick previews
-  denoised: new Map(), // the same, noise-reduced
+  finals: new Map(), // finalKey -> the same: what the export will be (develop.full_preview)
+  autoNoiseIso: null,
   cells: [],
   saving: Promise.resolve(),
 };
@@ -100,7 +101,46 @@ function formatValue(key, v) {
   return String(v);
 }
 
+// Noise reduction: null automatic (the server decides by ISO), 0 off, 100 on.
+const NR_SETTING = { auto: null, on: 100, off: 0 };
+const nrName = (setting) => (setting == null ? 'auto' : setting > 0 ? 'on' : 'off');
+const finalKey = (name, setting) => `${name}|${nrName(setting)}`;
+const currentKey = () => editCurrent() && finalKey(editCurrent(), ED.live?.noise);
+
+function nrExpected(name, setting) {
+  // Whether noise reduction will be on; for automatic, the server's decision once a final
+  // preview tells it (its grain), else the same rule from the ISO.
+  if (setting != null) return setting > 0;
+  const shown = ED.finals.get(finalKey(name, null))?.info;
+  if (shown) return shown.grain;
+  const iso = metas.get(name)?.iso;
+  return !!iso && iso >= ED.autoNoiseIso;
+}
+
+function updateNoise() {
+  const name = editCurrent();
+  const setting = ED.live?.noise ?? null;
+  for (const b of document.querySelectorAll('#nr button')) b.classList.toggle('on', !!ED.live && b.dataset.nr === nrName(setting));
+  const label = $('#nrval');
+  const iso = name && metas.get(name)?.iso;
+  label.textContent = !ED.live || setting != null ? '' : `${nrExpected(name, null) ? 'on' : 'off'}${iso ? ` at ISO ${iso}` : ''}`;
+  label.classList.add('default');
+}
+
+for (const b of document.querySelectorAll('#nr button')) {
+  b.addEventListener('click', () => {
+    if (!ED.live) return;
+    ED.live = { ...ED.live, noise: NR_SETTING[b.dataset.nr] };
+    updateSliders();
+    commit();
+    loadEdit(editCurrent());
+    if (ED.zoom) layoutEdit();
+    requestDraw();
+  });
+}
+
 function updateSliders() {
+  updateNoise();
   for (const el of SLIDERS) {
     const key = el.dataset.key;
     const input = el.querySelector('input');
@@ -178,22 +218,23 @@ function previewSide() {
 }
 
 // Each photo comes in two steps: a quick preview without noise reduction (~0.5 s), then
-// the export's own input shrunk, noise reduction included (develop.denoised_preview; ~3 s,
-// unless the server prepared it while you were on the photo before).
-function preview(name, denoised = false) {
-  const cache = denoised ? ED.denoised : ED.previews;
-  let p = cache.get(name);
+// the export's own input shrunk, noise reduction included if it's on (develop.full_preview;
+// ~3 s, unless the server prepared it while you were on the photo before).
+function preview(name, final = false, setting = null) {
+  const [cache, key] = final ? [ED.finals, finalKey(name, setting)] : [ED.previews, name];
+  let p = cache.get(key);
   if (!p) {
     const abort = new AbortController();
-    const promise = fetch(`/develop/${enc(name)}?w=${previewSide()}${denoised ? '&nr=1' : ''}&v=${S.version}`, { signal: abort.signal })
+    const extra = final ? `&final=1&noise=${setting ?? 'auto'}` : '';
+    const promise = fetch(`/develop/${enc(name)}?w=${previewSide()}${extra}&v=${S.version}`, { signal: abort.signal })
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.statusText))))
       .then(parsePreview);
     p = { promise, abort, info: null };
     promise.then(
       (info) => { p.info = info; },
-      () => { if (cache.get(name) === p) cache.delete(name); },
+      () => { if (cache.get(key) === p) cache.delete(key); },
     );
-    cache.set(name, p);
+    cache.set(key, p);
   }
   return p.promise;
 }
@@ -210,11 +251,12 @@ function requestDraw() {
     });
   }
   const loading = ED.view && visibleTiles().some((t) => !t.loaded);
+  const finishing = ED.shownKey !== currentKey() && nrExpected(editCurrent(), ED.live?.noise);
   $('#editnote').textContent = ED.before
     ? 'Before'
     : ED.shown !== editCurrent() ? 'Developing…'
     : loading ? 'Loading full size…'
-    : !ED.shownDenoised ? 'Reducing noise…' : '';
+    : finishing ? 'Reducing noise…' : '';
 }
 
 function layoutEdit() {
@@ -279,7 +321,7 @@ function tileRect(i, j) {
 
 function visibleTiles(margin = 0) {
   // The tiles on the canvas (and `margin` more around it), nearest its centre first.
-  if (!ED.view || ED.full.name !== editCurrent()) return [];
+  if (!ED.view || ED.full.key !== currentKey()) return [];
   const { fullWidth: fw, fullHeight: fh, fullTile: T } = ED.dev.info;
   const { x0, y0 } = ED.view;
   const cw = editCanvas.width;
@@ -300,9 +342,9 @@ function visibleTiles(margin = 0) {
 
 function wantTiles() {
   const name = editCurrent();
-  if (ED.full.name !== name) {
+  if (ED.full.key !== currentKey()) {
     for (const abort of ED.full.pending.values()) abort.abort();
-    ED.full = { name, loaded: new Map(), pending: new Map(), queue: [] };
+    ED.full = { key: currentKey(), name, noise: ED.live?.noise ?? 'auto', loaded: new Map(), pending: new Map(), queue: [] };
     ED.dev.allocFull(ED.dev.info.fullWidth, ED.dev.info.fullHeight);
   }
   ED.full.queue = visibleTiles(1).filter((t) => !t.loaded && !ED.full.pending.has(t.key));
@@ -315,7 +357,7 @@ function pumpTiles() {
     const { key, rect } = f.queue.shift();
     const abort = new AbortController();
     f.pending.set(key, abort);
-    fetch(`/full/${enc(f.name)}?t=${key}&v=${S.version}`, { signal: abort.signal })
+    fetch(`/full/${enc(f.name)}?t=${key}&noise=${f.noise}&v=${S.version}`, { signal: abort.signal })
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.statusText))))
       .then((buffer) => {
         if (ED.full !== f || ED.shown !== f.name) return;
@@ -425,25 +467,30 @@ function fitSideEdit() {
 function loadEdit(name) {
   if (!ED.dev) return; // no WebGL: the camera JPEG stays up
   const near = [0, 1, 2, -1].map((d) => ED.kept[ED.pos + d]).filter(Boolean);
+  // The server prepares final data for this photo and the next only, so their noise
+  // settings go along (this photo's may not be saved yet).
+  const setting = ED.live?.noise ?? null;
+  const next = near[1];
+  const nextSetting = next ? settingsOf(S.order.get(next)).noise : null;
   fetch('/api/develop-hint', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ names: near, w: previewSide() }),
+    body: JSON.stringify({ names: near, w: previewSide(), noise: [setting ?? 'auto', nextSetting ?? 'auto'] }),
   }).catch(() => {});
-  // The server prepares noise-reduced data for this photo and the next only (see develop-hint).
-  for (const [cache, keep] of [[ED.previews, near], [ED.denoised, near.slice(0, 2)]]) {
-    for (const [n, p] of cache) {
-      if (!keep.includes(n)) {
+  const keepFinal = [finalKey(name, setting), next && finalKey(next, nextSetting)];
+  for (const [cache, keep] of [[ED.previews, near], [ED.finals, keepFinal]]) {
+    for (const [k, p] of cache) {
+      if (!keep.includes(k)) {
         p.abort.abort();
-        cache.delete(n);
+        cache.delete(k);
       }
     }
   }
-  const show = (info) => {
+  const show = (info, key) => {
     if (editCurrent() !== name || S.mode !== 'edit') return;
     ED.dev.load(info);
     ED.shown = name;
-    ED.shownDenoised = info.grain;
+    ED.shownKey = key;
     updateSliders(); // the as-shot temperature is known now
     layoutEdit();
     // Then the neighbours, so the next photo is ready when you get there.
@@ -452,16 +499,17 @@ function loadEdit(name) {
   const failed = (err) => {
     if (err.name !== 'AbortError' && editCurrent() === name) toast(`Couldn't develop ${name}: ${err.message}`, true);
   };
-  const ready = ED.denoised.get(name)?.info;
+  const key = finalKey(name, setting);
+  const ready = ED.finals.get(key)?.info;
   if (ready) {
-    if (!(ED.shown === name && ED.shownDenoised)) show(ready);
-  } else {
-    preview(name).then((info) => { if (ED.shown !== name) show(info); }).catch(failed);
+    if (ED.shownKey !== key) show(ready, key);
+  } else if (ED.shown !== name) {
+    preview(name).then((info) => { if (ED.shown !== name) show(info, `${name}|quick`); }).catch(failed);
   }
-  preview(name, true)
+  preview(name, true, setting)
     .then((info) => {
-      if (!(ED.shown === name && ED.shownDenoised)) show(info);
-      if (editCurrent() === name && near[1]) preview(near[1], true).catch(() => {});
+      if (ED.shownKey !== key && currentKey() === key) show(info, key);
+      if (editCurrent() === name && next) preview(next, true, nextSetting).catch(() => {});
     })
     .catch(failed);
 }
@@ -586,6 +634,7 @@ async function editorEnter(name) {
       defaults: st.defaults,
       limits: st.limits,
       tempStep: st.tempStep,
+      autoNoiseIso: st.autoNoiseIso,
     });
     applyRuns(st);
     for (const el of SLIDERS) {

@@ -167,7 +167,7 @@ def main():
 
     table = fit_table(train)
     slope, iso0 = fit_shadow(high, table)
-    profile = look.Profile(table, slope, iso0)
+    profile = look.Profile(table, slope, iso0, look.load_profile(camera).noise)  # noise: calibrate_noise.py
 
     print("colour difference to the camera's JPEG (CIELAB dE; colour-only in brackets):")
     neutral = look.identity_table()

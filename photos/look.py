@@ -116,11 +116,20 @@ def model(scene: np.ndarray, tone: np.ndarray, table: np.ndarray, shadow_loss: f
 @dataclass
 class Profile:
     """A camera's colour rendering: table[chroma r-g, chroma b-g, brightness level] = output colour
-    at luminance 1; at high ISO a share of colour, fading with lightness, is taken out of dark tones."""
+    at luminance 1; at high ISO a share of colour, fading with lightness, is taken out of dark tones.
+    Also its sensor noise, for noise reduction (denoise.py)."""
 
     table: np.ndarray
     shadow_slope: float = 0.0  # share of colour lost in the darkest tones, per doubling of ISO above shadow_iso
     shadow_iso: float = 1e9
+    noise: tuple | None = None  # (a0, a1, b2): raw noise variance = (a0 + a1 ISO) signal + b2 ISO^2
+
+    def noise_at(self, iso: float | None) -> tuple[float, float] | None:
+        """(A, B): variance = A * signal + B, raw units above black."""
+        if self.noise is None or not iso:
+            return None
+        a0, a1, b2 = self.noise
+        return a0 + a1 * iso, b2 * iso * iso
 
     def shadow_loss(self, iso: float | None) -> float:
         if not iso:
@@ -128,7 +137,10 @@ class Profile:
         return float(np.clip(self.shadow_slope * np.log2(iso / self.shadow_iso), 0, 1))
 
     def save(self, path: Path):
-        np.savez_compressed(path, table=self.table.astype(np.float32), shadow=np.array([self.shadow_slope, self.shadow_iso]))
+        arrays = {"table": self.table.astype(np.float32), "shadow": np.array([self.shadow_slope, self.shadow_iso])}
+        if self.noise is not None:
+            arrays["noise"] = np.array(self.noise)
+        np.savez_compressed(path, **arrays)
 
     @classmethod
     def identity(cls) -> Profile:
@@ -145,7 +157,8 @@ def load_profile(camera: str | None) -> Profile:
     if camera and profile_path(camera).exists():
         with np.load(profile_path(camera)) as f:
             slope, iso = f["shadow"]
-            return Profile(f["table"], float(slope), float(iso))
+            noise = tuple(float(v) for v in f["noise"]) if "noise" in f.files else None
+            return Profile(f["table"], float(slope), float(iso), noise)
     return Profile.identity()
 
 

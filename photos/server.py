@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import develop, edits
+from . import denoise, develop, edits
 from .export import export_photo
 from .raw import IMAGE_EXTS, RAW_EXTS, Photo, read_file
 
@@ -109,9 +109,12 @@ class Library:
         self.previews = Prefetcher(
             lambda key: develop.preview(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
-        # The export's input at full size, for the editor's noise-reduced views: ~200 MB and
-        # ~3 s of work each, so one at a time, and only the photo on screen and the next.
-        self.fulls = Prefetcher(lambda name: develop.full(self.photos[name], read_file(self.photos[name].path)), workers=1, keep=3)
+        # The export's input at full size, by (name, noise reduction on), for the editor's final
+        # views: ~200 MB and 1.5-3 s of work each, for the photo on screen and the next (which
+        # waits for it). Two at a time, so a change to the photo on screen needn't wait for the next.
+        self.fulls = Prefetcher(
+            lambda key: develop.full(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=2, keep=4
+        )
         self.state_path = folder / STATE_FILE
         self.state = self._load()
         self._save_lock = threading.Lock()
@@ -159,6 +162,15 @@ class Library:
 
     def settings(self) -> dict[str, dict]:
         return dict(zip(self.names, edits.resolve(self.names, self.groups(), self.state["edits"])))
+
+    def full_key(self, name: str, noise: str | None = None):
+        """fulls key for a photo: its noise setting as the editor has it ("auto" or a number),
+        or as saved."""
+        if noise is None:
+            setting = self.settings()[name]["noise"]
+        else:
+            setting = None if noise == "auto" else float(noise)
+        return name, denoise.active(setting, self.photos[name].iso)
 
     def runs(self) -> dict:
         """What the editor shows: which photos share settings, and those settings."""
@@ -263,6 +275,7 @@ class Handler(BaseHTTPRequestHandler):
                     "raw": [p.is_raw for p in self.lib.photos.values()],
                     "defaults": develop.DEFAULTS,
                     "limits": develop.LIMITS,
+                    "autoNoiseIso": denoise.AUTO_ISO,
                     "tempStep": develop.TEMP_STEP,
                 }
             )
@@ -285,14 +298,16 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "clip":
                 self.lib.clips.result(name)
                 return self._send([photo.clipping(w)], "image/png", cache=True)
-            if kind == "develop" and "nr" in query:
-                return self._send([develop.denoised_preview(self.lib.fulls.get(name).result(), preview_size(w))], "application/octet-stream")
+            if kind == "develop" and "final" in query:
+                full = self.lib.fulls.get(self.lib.full_key(name, query.get("noise", [None])[0])).result()
+                return self._send([develop.full_preview(full, preview_size(w))], "application/octet-stream")
             if kind == "develop":
                 data = self.lib.previews.result((name, preview_size(w)))
                 return self._send([data], "application/octet-stream")
             if kind == "full":
                 i, j = (int(v) for v in query["t"][0].split(","))
-                return self._send([self.lib.fulls.get(name).result().tile(i, j)], "application/octet-stream")
+                full = self.lib.fulls.get(self.lib.full_key(name, query.get("noise", [None])[0])).result()
+                return self._send([full.tile(i, j)], "application/octet-stream")
         except CancelledError:  # the editor moved on while we waited (and won't read this)
             return self.send_error(HTTPStatus.CONFLICT, "dropped")
         except ConnectionError:
@@ -310,10 +325,11 @@ class Handler(BaseHTTPRequestHandler):
             self.lib.clips.want(raws)
             return self._json({"ok": True})
         if self.path == "/api/develop-hint":
-            # names[0] is on screen, then the next, then others nearby
+            # names[0] is on screen, then the next, then others nearby; noise: their settings
             size = preview_size(int(body.get("w", 0)))
             self.lib.previews.want([(n, size) for n in raws])
-            self.lib.fulls.want(raws[:2])
+            noise = [str(v) for v in body.get("noise", [])] + [None, None]
+            self.lib.fulls.want([self.lib.full_key(n, v) for n, v in zip(raws[:2], noise)])
             return self._json({"ok": True})
         if self.path == "/api/edit":
             name = body.get("name")

@@ -13,12 +13,14 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import numpy as np
 
 from .look import LUMA
 
+AUTO_ISO = 1000  # automatic noise reduction from this ISO; below it the camera's JPEGs barely reduce noise either
 STRENGTH = 0.68  # NLM filtering parameter h, in units of the (stabilised) noise
 SEARCH = 15  # NLM search window, raw-plane pixels
 PATCH = 5  # NLM patch size
@@ -28,6 +30,8 @@ GRAIN_PER_STOP = 0.33  # the camera keeps more texture at lower ISOs: this much 
 CHROMA_RADIUS = 3  # guided filter radius for colour, half-resolution pixels
 CHROMA_EPS = 0.004**2
 PHASES = ((0, 0), (0, 1), (1, 0), (1, 1))  # (row, column) of each Bayer plane within a 2x2 tile
+CEILING = 1.5  # a photo measuring noisier than this times the camera's typical noise at its ISO,
+CEILING_LEVEL = 0.18  # at this level (of the raw range: mid-grey), is denoised as typical instead
 
 
 @dataclass
@@ -45,31 +49,49 @@ def grain_weights(iso: int | None) -> tuple:
     return tuple(float(np.clip(m, 0.5, 3)) * w for w in GRAIN)
 
 
-def noise_model(mosaic: np.ndarray, black: float, pattern: np.ndarray) -> tuple[float, float]:
-    """variance = A * signal + B (raw units, black subtracted), from the two green photosites
-    of every other 2x2 tile (as accurate as all of them, 4x faster): same light, independent
-    noise."""
+def noise_samples(mosaic: np.ndarray, black: float, pattern: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Noise variance by brightness, measured in the photo: (signal levels, variances), raw
+    units above black. From the two green photosites of every other 2x2 tile (same light,
+    independent noise; every other is as accurate as all of them, 4x faster). Fine texture
+    everywhere, like foliage, reads as noise too: see CEILING."""
     h, w = mosaic.shape[0] // 2 * 2, mosaic.shape[1] // 2 * 2
     greens = [p for p in PHASES if pattern[p] in (1, 3)]
     g1, g2 = (mosaic[dy:h:4, dx:w:4].astype(np.float32) - black for dy, dx in greens)
     m, d = (g1 + g2) / 2, g1 - g2
-    bins = np.quantile(m, np.linspace(0.01, 0.995, 25))
     xs, vs = [], []
-    for lo, hi in zip(bins[:-1], bins[1:]):
+    for lo, hi in itertools.pairwise(np.quantile(m, np.linspace(0.01, 0.995, 25))):
         dd = d[(m >= lo) & (m < hi)]
-        if dd.size < 100:
-            continue
-        xs.append((lo + hi) / 2)
-        vs.append((np.median(np.abs(dd - np.median(dd))) / 0.6745) ** 2 / 2)
-    A, B = np.polyfit(xs, vs, 1)
+        if dd.size >= 100:
+            xs.append((lo + hi) / 2)
+            vs.append((np.median(np.abs(dd - np.median(dd))) / 0.6745) ** 2 / 2)
+    return np.array(xs), np.array(vs)
+
+
+def noise_model(mosaic: np.ndarray, black: float, pattern: np.ndarray) -> tuple[float, float]:
+    """(A, B): variance = A * signal + B, raw units above black, measured in this photo."""
+    A, B = np.polyfit(*noise_samples(mosaic, black, pattern), 1)
     return max(float(A), 1e-3), max(float(B), 1e-3)
+
+
+def trusted(measured: tuple[float, float], typical: tuple[float, float], level: float) -> tuple[float, float]:
+    """The measured noise (A, B), unless at `level` it's more than CEILING times the camera's
+    typical noise: then that's texture, and the typical noise is used."""
+    variance = lambda model: model[0] * level + model[1]
+    return typical if variance(measured) > CEILING * variance(typical) else measured
+
+
+def active(setting: float | None, iso: int | None) -> bool:
+    """Whether a photo gets noise reduction: its setting (None: automatic, 0: off, 100: on)."""
+    if setting is None:
+        return bool(iso) and iso >= AUTO_ISO
+    return setting > 0
 
 
 def supported(raw) -> bool:
     return raw.raw_pattern is not None and np.asarray(raw.raw_pattern).shape == (2, 2)
 
 
-def raw_nlm(raw, black: float, scale: float, color) -> tuple[np.ndarray, int]:
+def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float] | None = None) -> tuple[np.ndarray, int]:
     """Denoise LibRaw's raw buffer in place (on the GPU).
 
     Returns the luminance removed, the grain's source (one value per 2x2 tile, scene units,
@@ -78,6 +100,11 @@ def raw_nlm(raw, black: float, scale: float, color) -> tuple[np.ndarray, int]:
     leaves flat patches, different per colour, that show as colour blotches once deep
     shadows are lifted. So they're written as many times larger as 16 bits allow (16x for
     12-bit raws); black and white levels scale with them.
+
+    The noise is measured in the photo itself. But a photo full of fine texture reads far
+    noisier than it is (DSC_9331, ISO 200: 10x) and would be smeared, so if the camera's
+    typical noise at this ISO is known (`typical`, look.Profile.noise_at) and the photo
+    measures more than CEILING times that, the typical noise is used instead.
 
     scale: raw units -> our normalised camera RGB (1 / (saturation - black))."""
     from . import gpu
@@ -89,6 +116,8 @@ def raw_nlm(raw, black: float, scale: float, color) -> tuple[np.ndarray, int]:
     weights = [lum[c] / colours.count(c) for c in colours]  # the two greens are averaged
     gain = max(1, 65535 // max(int(raw.white_level), int(mosaic.max())))
     model = noise_model(mosaic, black, pattern)
+    if typical:
+        model = trusted(model, typical, CEILING_LEVEL * (raw.white_level - black))
     denoised, removed = gpu.raw_nlm(mosaic, black, *model, weights, STRENGTH, SEARCH, PATCH, gain)
     mosaic[...] = denoised
     return removed, gain

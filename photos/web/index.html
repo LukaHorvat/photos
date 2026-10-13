@@ -70,6 +70,14 @@
           <input type="range" min="-100" max="100" step="1">
         </label>
       </div>
+      <div id="nr" class="toggle">
+        <span class="sname">Noise reduction</span><span class="sval" id="nrval"></span>
+        <div class="seg">
+          <button class="chip" data-nr="auto" title="On from ISO 1000, like the camera's own JPEGs">Auto</button>
+          <button class="chip" data-nr="on">On</button>
+          <button class="chip" data-nr="off">Off</button>
+        </div>
+      </div>
       <p class="hint">Double-click a slider to reset it. <kbd>\</kbd> shows the photo without edits.</p>
       <button id="resetPhoto" class="chip">Reset this photo</button>
     </aside>
