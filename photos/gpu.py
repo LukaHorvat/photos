@@ -60,14 +60,15 @@ def _f32(a) -> np.ndarray:
     return np.ascontiguousarray(a, np.float32)
 
 
-def raw_nlm(mosaic: np.ndarray, black: float, A: float, B: float, weights, h: float, search: int, patch: int):
+def raw_nlm(mosaic: np.ndarray, black: float, A: float, B: float, weights, h: float, search: int, patch: int, gain: int = 1):
     """Non-local means on a Bayer mosaic (uint16, 2x2 pattern): its four planes as one
     4-channel image, so every colour gets the same weights, after a generalized Anscombe
     transform for noise variance A * signal + B (black subtracted), which makes the noise ~1.
 
-    Returns the denoised mosaic (uint16) and, per 2x2 tile, sum(weights * removed) over the
-    four photosites (float32, half size)."""
-    out, removed = _run(_raw_nlm, np.ascontiguousarray(mosaic, np.uint16), black, A, B, weights, h, search, patch)
+    Returns the denoised mosaic, times `gain` (uint16: what denoising adds below one raw unit
+    survives), and per 2x2 tile, sum(weights * removed) over the four photosites (float32,
+    half size)."""
+    out, removed = _run(_raw_nlm, np.ascontiguousarray(mosaic, np.uint16), black, A, B, weights, h, search, patch, gain)
     hh, ww = mosaic.shape[0] // 2, mosaic.shape[1] // 2
     return np.frombuffer(out, np.uint16).reshape(mosaic.shape), np.frombuffer(removed, np.float32).reshape(hh, ww)
 
@@ -124,13 +125,14 @@ SHADERS = {
         void main() { z = forward(tile(ivec2(gl_FragCoord.xy))); }""",
     # The denoised mosaic: the NLM result (sum / weight) back in raw units.
     "raw_out": RAW + """
-        uniform sampler2D sum; uniform sampler2D weight;
+        uniform sampler2D sum; uniform sampler2D weight; uniform float gain;
         out uint v;
         void main() {
           ivec2 p = ivec2(gl_FragCoord.xy), t = p / 2;
-          if (any(greaterThanEqual(t, textureSize(sum, 0)))) { v = texelFetch(raw, p, 0).r; return; }  // odd size: no whole tile
-          vec4 x = inverse(texelFetch(sum, t, 0) / texelFetch(weight, t, 0).r);
-          v = uint(clamp(round(x[(p.y & 1) * 2 + (p.x & 1)] + black), 0.0, 65535.0));
+          float x = float(texelFetch(raw, p, 0).r);  // odd size: no whole tile here
+          if (all(lessThan(t, textureSize(sum, 0))))
+            x = inverse(texelFetch(sum, t, 0) / texelFetch(weight, t, 0).r)[(p.y & 1) * 2 + (p.x & 1)] + black;
+          v = uint(clamp(round(x * gain), 0.0, 65535.0));
         }""",
     "raw_removed": RAW + """
         uniform sampler2D sum; uniform sampler2D weight; uniform vec4 weights;
@@ -360,7 +362,7 @@ def _box(src, tmp, out, r: int):
         fb.release()
 
 
-def _raw_nlm(mosaic, black, A, B, weights, h, search, patch):
+def _raw_nlm(mosaic, black, A, B, weights, h, search, patch, gain):
     import moderngl
 
     ctx = _setup()["ctx"]
@@ -386,7 +388,7 @@ def _raw_nlm(mosaic, black, A, B, weights, h, search, patch):
             ctx.blend_func = moderngl.ONE, moderngl.ONE
             _pass("nlm_acc", fbs["acc"], {"dist": dist, "img": z}, inv_n=inv_n, inv_h2=1 / (h * h), **o)
         ctx.disable(moderngl.BLEND)
-        _pass("raw_out", fbs["out"], {"raw": raw, "sum": acc, "weight": wgt}, **common)
+        _pass("raw_out", fbs["out"], {"raw": raw, "sum": acc, "weight": wgt}, gain=float(gain), **common)
         _pass("raw_removed", fbs["removed"], {"raw": raw, "sum": acc, "weight": wgt}, weights=tuple(weights), **common)
         return _read(out), _read(removed)
     finally:

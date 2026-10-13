@@ -69,10 +69,15 @@ def supported(raw) -> bool:
     return raw.raw_pattern is not None and np.asarray(raw.raw_pattern).shape == (2, 2)
 
 
-def raw_nlm(raw, black: float, scale: float, color) -> np.ndarray:
-    """Denoise LibRaw's raw buffer in place (on the GPU). Returns the luminance removed, the
-    grain's source: one value per 2x2 tile, scene units, as-shot white balance, not yet
-    oriented.
+def raw_nlm(raw, black: float, scale: float, color) -> tuple[np.ndarray, int]:
+    """Denoise LibRaw's raw buffer in place (on the GPU).
+
+    Returns the luminance removed, the grain's source (one value per 2x2 tile, scene units,
+    as-shot white balance, not yet oriented), and the gain the buffer now has: denoised
+    values are smooth to a fraction of a raw unit, and rounding them back to whole units
+    leaves flat patches, different per colour, that show as colour blotches once deep
+    shadows are lifted. So they're written as many times larger as 16 bits allow (16x for
+    12-bit raws); black and white levels scale with them.
 
     scale: raw units -> our normalised camera RGB (1 / (saturation - black))."""
     from . import gpu
@@ -82,9 +87,11 @@ def raw_nlm(raw, black: float, scale: float, color) -> np.ndarray:
     colours = [{0: 0, 1: 1, 2: 2, 3: 1}[int(pattern[p])] for p in PHASES]  # LibRaw calls the second green 3
     lum = (color.rgb_cam.T @ LUMA) * color.as_shot * scale  # luminance of each camera channel
     weights = [lum[c] / colours.count(c) for c in colours]  # the two greens are averaged
-    denoised, removed = gpu.raw_nlm(mosaic, black, *noise_model(mosaic, black, pattern), weights, STRENGTH, SEARCH, PATCH)
+    gain = max(1, 65535 // max(int(raw.white_level), int(mosaic.max())))
+    model = noise_model(mosaic, black, pattern)
+    denoised, removed = gpu.raw_nlm(mosaic, black, *model, weights, STRENGTH, SEARCH, PATCH, gain)
     mosaic[...] = denoised
-    return removed
+    return removed, gain
 
 
 def orient(img: np.ndarray, flip: int) -> np.ndarray:

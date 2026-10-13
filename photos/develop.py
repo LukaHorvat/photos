@@ -270,11 +270,12 @@ def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None)
         # Lossy NEFs saturate a few codes under the nominal white level (see raw.Photo.clipping_mask).
         top = int(raw.raw_image_visible.max())
         saturation = top if top >= 0.98 * raw.white_level else raw.white_level
+        gain = 1  # raw values are this many times larger after noise reduction
         if denoise and dn.supported(raw):
-            removed = dn.raw_nlm(raw, black, 1 / (saturation - black), color)
+            removed, gain = dn.raw_nlm(raw, black, 1 / (saturation - black), color)
             flip = raw.sizes.flip
         pad = min(black, BLACK_PAD)
-        rgb = raw.postprocess(half_size=half_size, user_black=black - pad, user_sat=saturation, **RAW_LINEAR)
+        rgb = raw.postprocess(half_size=half_size, user_black=gain * (black - pad), user_sat=gain * saturation, **RAW_LINEAR)
     # LibRaw outputs (raw - user_black) * 65535 / user_sat.
     rgb = rgb.astype(np.float32)
     rgb *= np.float32(saturation / 65535 / (saturation - black))

@@ -69,6 +69,12 @@ def test_raw_nlm_is_non_local_means_in_the_stabilised_domain(gpu):
     assert (got - truth)[inner, inner].std() < 0.7 * (planes - truth)[inner, inner].std()  # it did denoise
     # What was removed, weighted per photosite (from the unrounded result)
     assert np.abs(removed - (planes - got) @ weights).max() <= 0.5 * sum(weights) + 1e-3
+    # With a gain, the result keeps fractions of a raw unit
+    gain = 65535 // int(mosaic.max())
+    out_fine, _ = gpu.raw_nlm(mosaic, BLACK, A, B, weights, h, search, patch, gain=gain)
+    fine = np.stack([out_fine[dy::2, dx::2].astype(np.float64) / gain - BLACK for dy, dx in denoise.PHASES], -1)
+    assert np.abs(fine - got).max() <= 0.5 + 0.5 / gain
+    assert np.abs(fine[inner, inner] - expected[inner, inner]).max() < np.abs(got[inner, inner] - expected[inner, inner]).max()
 
 
 def test_grain_follows_iso():
