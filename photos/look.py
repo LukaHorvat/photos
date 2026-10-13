@@ -29,6 +29,7 @@ PROFILES = Path(__file__).parent / "profiles"
 TABLE_SIZE, TABLE_LEVELS = 33, 8
 CONTRAST_MAX = 0.45  # contrast curve strength at +-100; above 0.5 it would stop being monotonic
 WORK_SCALE = 4  # fitting a photo's tone happens at a quarter of its JPEG's size
+TONE_CHROMA = 0.45  # blocks more saturated than this (chromaticity distance from grey) don't set the tone curve
 
 # Without an embedded JPEG: one curve fitted to D3500 JPEGs, y = (1 + K) t^C / (t^C + K), t = G x.
 FALLBACK_CURVE = (0.596, 1.650, 0.029)
@@ -261,7 +262,15 @@ def fit_curve(x: np.ndarray, y: np.ndarray) -> np.ndarray | None:
 
 def fit_tone(s: Samples) -> np.ndarray | None:
     """The photo's tone curve. Blocks set it up to the brightest evenly coloured areas; the
-    near-clipped pixels set the top, where the camera reaches white before the sensor clips."""
+    near-clipped pixels set the top, where the camera reaches white before the sensor clips.
+
+    Only the less saturated blocks count, if there are enough: the camera renders strongly
+    saturated colours brighter than its tone curve does (that's the colour table's part), and
+    a frame filled with them (DSC_9890: a red bus) would otherwise brighten everything else at
+    their brightness, such as a face."""
+    calm = np.hypot(*chromaticity(s.S).T) < TONE_CHROMA
+    if calm.sum() >= 300:
+        s = Samples(s.S[calm], s.C[calm], s.hS, s.hC, s.hP)
     tone = fit_curve(s.S @ LUMA, s.C @ LUMA)
     if tone is None or len(s.hS) < 500:
         return tone
