@@ -83,6 +83,20 @@ class Prefetcher:
 
         self.get(keys[0]).add_done_callback(neighbours)
 
+    def settle(self, match):
+        """Drop queued work on the keys for which match(key), and wait for what's running (so
+        no file stays open)."""
+        with self.lock:
+            items = [(k, f) for k, f in self.futures.items() if match(k)]
+            for k, _ in items:
+                del self.futures[k]
+        for _, f in items:
+            if not f.cancel():
+                try:
+                    f.result(timeout=60)
+                except Exception:
+                    pass
+
     def result(self, key):
         while True:
             try:
@@ -122,6 +136,7 @@ class Library:
         self._groups: list[int] | None = None
         self._taken: list[str | None] = []
         self.export = Export(self)
+        self.deletion = Deletion(self)
 
     def _load(self) -> dict:
         try:
@@ -168,13 +183,22 @@ class Library:
         files = self._files(names)
         return {"photos": len(names), "files": len(files), "bytes": sum(f.stat().st_size for f in files), "recycle": trash.recycles(self.folder)}
 
-    def delete_rejected(self) -> dict:
+    def delete_rejected(self, progress=lambda done, total: None) -> dict:
         """Delete the rejected photos and their files (to the Recycle Bin, where there is one).
         The other photos keep the settings they have, even where an edit started on a deleted one."""
         with self._save_lock:
             names = [n for n in self.names if self.state["marks"].get(n) == "reject"]
             settings = self.settings()
-            errors = trash.remove(self._files(names))
+            files = self._files(names)
+            # Windows won't delete a file that's open: first let our own reads of them finish.
+            doomed = set(names)
+            for prefetcher in (self.clips, self.previews, self.fulls):
+                prefetcher.settle(lambda key: (key if isinstance(key, str) else key[0]) in doomed)
+            count = iter(range(1, len(files) + 1))
+            errors = trash.remove(files, lambda path, error: progress(next(count), len(files)))
+            if errors:  # something else had them open for a moment (a thumbnailer, say): once more
+                time.sleep(1)
+                errors = trash.remove(list(errors))
             gone = [n for n in names if not self.photos[n].path.exists()]
             for n in gone:
                 del self.photos[n]
@@ -183,7 +207,7 @@ class Library:
             self._groups = None  # a deleted photo may have been what held a series together
             self.state["edits"] = edits.normalize(self.names, self.groups(), {n: settings[n] for n in self.names})
             self._save()
-        return {"deleted": len(gone), "errors": errors}
+        return {"deleted": len(gone), "errors": [f"{p.name}: {why}" for p, why in errors.items()]}
 
     def groups(self) -> list[int]:
         """Series number of every photo; reads all headers the first time (~1 s)."""
@@ -236,6 +260,40 @@ class Library:
         for t in threads:
             t.start()
         threading.Thread(target=lambda: ([t.join() for t in threads], self.groups()), daemon=True).start()
+
+
+class Deletion:
+    """Deleting the rejected photos in the background, so the culler can show progress."""
+
+    def __init__(self, lib: Library):
+        self.lib = lib
+        self.lock = threading.Lock()
+        self.status = {"running": False, "done": 0, "total": 0, "deleted": 0, "errors": []}
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {**self.status, "errors": list(self.status["errors"])}
+
+    def start(self) -> dict:
+        with self.lock:
+            if self.status["running"]:
+                return {**self.status}
+            self.status.update(running=True, done=0, total=0, deleted=0, errors=[])
+
+        def progress(done, total):
+            with self.lock:
+                self.status.update(done=done, total=total)
+
+        def run():
+            try:
+                result = self.lib.delete_rejected(progress)
+            except Exception as e:
+                result = {"deleted": 0, "errors": [str(e)]}
+            with self.lock:
+                self.status.update(running=False, **result)
+
+        threading.Thread(target=run, daemon=True).start()
+        return self.snapshot()
 
 
 class Export:
@@ -323,6 +381,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self.lib.export.snapshot())
         if path == "/api/rejected":
             return self._json(self.lib.rejected())
+        if path == "/api/delete-rejected":
+            return self._json(self.lib.deletion.snapshot())
         kind, _, name = path.lstrip("/").partition("/")
         photo = self.lib.photos.get(name)
         if photo is None:
@@ -381,7 +441,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/export":
             return self._json(self.lib.export.start())
         if self.path == "/api/delete-rejected":
-            return self._json(self.lib.delete_rejected())
+            return self._json(self.lib.deletion.start())
         if self.path != "/api/mark":
             return self.send_error(HTTPStatus.NOT_FOUND)
         name, mark = body.get("name"), body.get("mark")

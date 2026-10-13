@@ -31,3 +31,42 @@ def test_deleting_rejected_photos(tmp_path):
     assert settings["p1.jpg"] == develop.DEFAULTS and settings["p3.jpg"]["compress"] == 40  # kept what it had
     assert server.Library(tmp_path).settings() == settings  # and saved so
     assert edits.normalize(lib.names, lib.groups(), lib.state["edits"]) == lib.state["edits"]
+
+
+def in_use(times):
+    """trash.remove where Windows refuses a file that's open, the first `times` attempts."""
+    calls = []
+
+    def remove(paths, done=lambda path, error: None):
+        calls.append(list(paths))
+        errors = {}
+        for path in paths:
+            if len(calls) <= times:
+                errors[path] = "The process cannot access the file because it is being used by another process."
+            else:
+                path.unlink()
+            done(path, errors.get(path))
+        return errors
+
+    return remove, calls
+
+
+def test_a_photo_in_use_is_tried_again_and_else_stays_rejected(tmp_path, monkeypatch):
+    for k, t in enumerate(["12:00:00", "12:00:05", "12:00:07"], 1):
+        shoot(tmp_path, f"p{k}.jpg", f"2026:05:01 {t}")
+    monkeypatch.setattr(server.time, "sleep", lambda s: None)
+    lib = server.Library(tmp_path)
+    lib.set_mark("p2.jpg", "reject")
+
+    remove, calls = in_use(times=1)  # open for a moment: the second try works
+    monkeypatch.setattr(server.trash, "remove", remove)
+    steps = []
+    assert lib.delete_rejected(lambda done, total: steps.append((done, total))) == {"deleted": 1, "errors": []}
+    assert len(calls) == 2 and steps == [(1, 1)] and lib.names == ["p1.jpg", "p3.jpg"]
+
+    lib.set_mark("p3.jpg", "reject")
+    remove, calls = in_use(times=2)  # still open: it stays, marked rejected, and says why
+    monkeypatch.setattr(server.trash, "remove", remove)
+    result = lib.delete_rejected()
+    assert result["deleted"] == 0 and result["errors"] == ["p3.jpg: The process cannot access the file because it is being used by another process."]
+    assert lib.names == ["p1.jpg", "p3.jpg"] and lib.state["marks"]["p3.jpg"] == "reject"

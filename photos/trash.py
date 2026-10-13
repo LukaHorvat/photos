@@ -9,15 +9,22 @@ import subprocess
 from functools import cache
 from pathlib import Path
 
+# One line out per file, as soon as it's done: "ok<TAB>path" or "error<TAB>path<TAB>why".
 RECYCLE = r"""
 [Console]::InputEncoding = [Text.Encoding]::UTF8
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName Microsoft.VisualBasic
 foreach ($path in [Console]::In.ReadToEnd().Split("`n")) {
   $path = $path.Trim()
-  if ($path) {
-    try { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($path, 'OnlyErrorDialogs', 'SendToRecycleBin') }
-    catch { Write-Output "$path`: $($_.Exception.Message)" }
+  if (-not $path) { continue }
+  try {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($path, 'OnlyErrorDialogs', 'SendToRecycleBin')
+    [Console]::Out.WriteLine("ok`t$path")
+  } catch {
+    $why = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+    [Console]::Out.WriteLine("error`t$path`t$why")
   }
+  [Console]::Out.Flush()
 }
 """
 
@@ -44,23 +51,39 @@ def recycles(folder: Path) -> bool:
     return win is not None and (Path(f"/mnt/{win[0].lower()}") / "$Recycle.Bin").is_dir()
 
 
-def remove(paths: list[Path]) -> list[str]:
-    """Delete the files; returns what went wrong, one line per file that couldn't be."""
-    if not paths:
-        return []
-    errors = []
-    if all(recycles(p.parent) for p in paths):
-        proc = subprocess.run(
+def remove(paths: list[Path], done=lambda path, error: None) -> dict[Path, str]:
+    """Delete the files, calling done(path, error or None) after each. Returns why each file
+    that's still there couldn't be deleted."""
+    errors = {}
+
+    def finished(path: Path, error: str | None):
+        if path.exists():
+            errors[path] = error or "it's still there"
+        done(path, errors.get(path))
+
+    if paths and all(recycles(p.parent) for p in paths):
+        by_windows = {windows_path(p): p for p in paths}
+        proc = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", RECYCLE],
-            input="\n".join(windows_path(p) for p in paths).encode(),
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
-        errors = [line for line in proc.stdout.decode(errors="replace").splitlines() if line.strip()]
+        proc.stdin.write("\n".join(by_windows).encode())
+        proc.stdin.close()
+        for line in proc.stdout:
+            status, _, rest = line.decode(errors="replace").lstrip("\ufeff").rstrip("\r\n").partition("\t")
+            win, _, why = rest.partition("\t")
+            if win in by_windows:
+                finished(by_windows.pop(win), None if status == "ok" else why or "it couldn't be deleted")
+        proc.wait()
+        for path in by_windows.values():  # never reported back
+            finished(path, "the Recycle Bin didn't take it")
     else:
         for p in paths:
             try:
                 os.remove(p)
+                finished(p, None)
             except OSError as e:
-                errors.append(f"{p}: {e}")
-    still = [f"{p}: still there" for p in paths if p.exists() and not any(line.startswith(windows_path(p) or str(p)) for line in errors)]
-    return errors + still
+                finished(p, e.strerror or str(e))
+    return errors

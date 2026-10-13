@@ -675,18 +675,25 @@ document.addEventListener('keydown', (e) => {
 const sizeText = (bytes) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
 
 $('#deleteRejected').addEventListener('click', async () => {
+  const button = $('#deleteRejected');
   try {
     const r = await (await fetch('/api/rejected')).json();
     if (!r.photos) return toast('No rejected photos');
-    const what = `${r.photos} rejected photo${r.photos === 1 ? '' : 's'}` + (r.files > r.photos ? ` and ${r.files - r.photos} file${r.files - r.photos === 1 ? '' : 's'} that go with them` : '');
+    const what = `${r.photos} rejected photo${r.photos === 1 ? '' : 's'}` + (r.files > r.photos ? ` and ${r.files - r.photos === 1 ? '1 file that goes' : `${r.files - r.photos} files that go`} with them` : '');
     const where = r.recycle ? 'to the Recycle Bin' : 'permanently (there is no Recycle Bin here)';
     if (!confirm(`Delete ${what} (${sizeText(r.bytes)}) ${where}?`)) return;
-    toast('Deleting…');
-    const res = await (await fetch('/api/delete-rejected', { method: 'POST' })).json();
-    // Stay where you were: on this photo, or the nearest one that's left.
+    // Move off a rejected photo first (Windows won't delete a file being read), staying near.
     const here = S.order.get(current() ?? S.lastName) ?? 0;
     const left = (n) => S.marks[n] !== 'reject';
     const keep = S.photos.slice(here).find(left) ?? S.photos.slice(0, here).reverse().find(left);
+    if (S.list.includes(keep)) go(S.list.indexOf(keep));
+    button.disabled = true;
+    let res = await (await fetch('/api/delete-rejected', { method: 'POST' })).json();
+    while (res.running) {
+      button.textContent = res.total ? `Deleting ${res.done} / ${res.total}…` : 'Deleting…';
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      res = await (await fetch('/api/delete-rejected')).json();
+    }
     const st = await (await fetch('/api/state')).json();
     S.photos = st.photos;
     S.order = new Map(S.photos.map((n, i) => [n, i]));
@@ -696,12 +703,16 @@ $('#deleteRejected').addEventListener('click', async () => {
     render();
     save();
     if (res.errors.length) {
-      toast(`Deleted ${res.deleted}; ${res.errors.length} couldn't be: ${res.errors[0]}`, true);
+      const which = res.errors.length === 1 ? res.errors[0] : `${res.errors.length} files, e.g. ${res.errors[0]}`;
+      toast(`Deleted ${res.deleted}, but couldn't delete ${which}. It stays marked rejected: try again.`, true);
     } else {
-      toast(`Deleted ${res.deleted} rejected photo${res.deleted === 1 ? '' : 's'} ${r.recycle ? 'to the Recycle Bin' : ''}`);
+      toast(`Deleted ${res.deleted} rejected photo${res.deleted === 1 ? '' : 's'}${r.recycle ? ' to the Recycle Bin' : ''}`);
     }
   } catch (err) {
     toast(`Couldn't delete: ${err.message}`, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Delete rejected…';
   }
 });
 
