@@ -626,28 +626,74 @@ def _setup() -> dict:
         prog = ctx.program(vertex_shader=EXPORT_VERTEX, fragment_shader=(WEB / "develop.frag").read_text())
         quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], "f4").tobytes())
         _gl.update(ctx=ctx, prog=prog, quad=quad, vao=ctx.vertex_array(prog, [(quad, "2f", "pos")]), passes={})
-        _gl["finish"] = _gl_finish() or ctx.finish
+        _gl["c"] = _gl_functions()
+        _gl["finish"] = ctx.finish if _gl["c"] is None else _gl["c"].glFinish
     return _gl
 
 
-def _gl_finish():
-    """glFinish through ctypes, which lets go of the GIL while it waits. moderngl holds the GIL
-    while it blocks, so waiting for the GPU in a read stalls every other thread (the other
-    exports' Python code)."""
+def _gl_functions():
+    """GL through ctypes, which lets go of the GIL while a call runs, for the calls that take
+    long: waiting for the GPU, and copying images to and from it (~100 ms for a full-size one).
+    moderngl holds the GIL meanwhile, which stalls every other thread (the other exports'
+    Python code, the editor's quick preview)."""
     import ctypes
 
     for lib in ("libGL.so.1", "libOpenGL.so.0"):
         try:
-            return ctypes.CDLL(lib).glFinish
+            gl = ctypes.CDLL(lib)
+            gl.glFinish, gl.glPixelStorei, gl.glReadPixels, gl.glGetTexImage, gl.glTexSubImage2D  # all there?
+            return gl
         except (OSError, AttributeError):
             continue
     return None
 
 
-def _read(obj, **kwargs) -> bytes:
-    """Read a texture or framebuffer once the GPU is done (see _gl_finish)."""
-    _setup()["finish"]()
-    return obj.read(**kwargs)
+# GL's pixel formats (normalized or float, integer) by components, and types by moderngl dtype
+_FORMATS = {1: (0x1903, 0x8D94), 2: (0x8227, 0x8228), 3: (0x1907, 0x8D98), 4: (0x1908, 0x8D99)}
+_TYPES = {"f1": 0x1401, "f2": 0x140B, "f4": 0x1406, "u1": 0x1401, "u2": 0x1403, "u4": 0x1405, "i1": 0x1400, "i2": 0x1402, "i4": 0x1404}
+GL_TEXTURE_2D, GL_PACK_ALIGNMENT, GL_UNPACK_ALIGNMENT = 0x0DE1, 0x0D05, 0x0CF5
+
+
+def _read(obj, components: int | None = None, dtype: str = "f1") -> np.ndarray:
+    """A texture's or a framebuffer's (first attachment's) pixels, as bytes (uint8), once the
+    GPU is done; framebuffers in `components` and `dtype`."""
+    import ctypes
+
+    import moderngl
+
+    gl = _setup()
+    gl["finish"]()
+    texture = isinstance(obj, moderngl.Texture)
+    if texture:
+        components, dtype = obj.components, obj.dtype
+    if gl["c"] is None:
+        return np.frombuffer(obj.read() if texture else obj.read(components=components, dtype=dtype, alignment=1), np.uint8)
+    w, h = obj.size
+    out = np.empty(h * w * components * int(dtype[1]), np.uint8)
+    fmt, typ, ptr = _FORMATS[components][dtype[0] in "ui"], _TYPES[dtype], ctypes.c_void_p(out.ctypes.data)
+    gl["c"].glPixelStorei(GL_PACK_ALIGNMENT, 1)
+    if texture:
+        obj.use(0)
+        gl["c"].glGetTexImage(GL_TEXTURE_2D, 0, fmt, typ, ptr)
+    else:
+        obj.use()
+        gl["c"].glReadPixels(0, 0, w, h, fmt, typ, ptr)
+    return out
+
+
+def _write(tex, data):
+    """Upload data (its dtype the texture's) into a whole texture (see _gl_functions)."""
+    import ctypes
+
+    c = _setup()["c"]
+    data = np.ascontiguousarray(data)
+    if c is None:
+        tex.write(data)
+        return
+    (w, h), fmt = tex.size, _FORMATS[tex.components][tex.dtype[0] in "ui"]
+    tex.use(0)
+    c.glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+    c.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, fmt, _TYPES[tex.dtype], ctypes.c_void_p(data.ctypes.data))
 
 
 def _pass(name: str, target, textures: dict, **uniforms):
@@ -676,7 +722,7 @@ def _texture(size, components, data=None, dtype="f4", linear=False):
     free = _pool.get((tuple(size), components, dtype))
     tex = free.pop() if free else _setup()["ctx"].texture(size, components, dtype=dtype)
     if data is not None:
-        tex.write(data)
+        _write(tex, data)
     tex.filter = (moderngl.LINEAR, moderngl.LINEAR) if linear else (moderngl.NEAREST, moderngl.NEAREST)
     tex.repeat_x = tex.repeat_y = False
     return tex
@@ -824,7 +870,7 @@ def _resize(rgb, in_size, size, box, shader: str, components: int, **uniforms) -
     try:
         _pass(shader, fbs[0], {"rgb": rgb, "bounds": bx}, **uniforms)
         _pass("box_columns", fbs[1], {"src": rows, "bounds": by})
-        return np.frombuffer(_read(fbs[1], components=components, dtype="f4"), np.float32).reshape(oh, ow, components)
+        return _read(fbs[1], components=components, dtype="f4").view(np.float32).reshape(oh, ow, components)
     finally:
         _release(bx, by, rows, small, *fbs)
 
@@ -924,6 +970,6 @@ def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
                 prog[name].value = tuple(value) if isinstance(value, (list, tuple, np.ndarray)) else value
         fbo.use()
         gl["vao"].render(moderngl.TRIANGLE_STRIP)
-        return np.frombuffer(_read(fbo, components=3, alignment=1), np.uint8).reshape(h, w, 3)
+        return _read(fbo, components=3).reshape(h, w, 3)
     finally:
         _release(*owned)
