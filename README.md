@@ -27,7 +27,8 @@ be grey or white, `Shift W` on skin, which sets only the tint: skin's hue is abo
 the same on everyone, its warmth and saturation aren't. One shader
 (`web/develop.frag`) does it, in the browser for the preview, so sliders respond
 instantly, and on the server's GPU for exports, so an export is what the editor
-showed.
+showed. At full size the raw is demosaiced on the GPU too: LibRaw's own AHD, ported to
+give the same result to the bit, ~10x faster than LibRaw runs it.
 
 Unedited, a photo looks like the camera's own JPEG (`look.py`): its tone curve is
 fitted to the JPEG embedded in that raw (the camera adapts it per scene), and
@@ -55,7 +56,7 @@ uv run python scripts/calibrate_noise.py /mnt/d/Radno
 ```
 
 The editor shows what the export will be. The server prepares the export's own
-input at full size (1.5-5 s per photo, for the photo on screen and then the next
+input at full size (1-3 s per photo, for the photo on screen and then the next
 one, so at editing pace it's ready when you get there); until then a quick preview
 without noise reduction stands in ("Reducing noise…"). The browser develops a
 shrunk copy for the whole-photo view, and `Z` (or a click) shows 100% at the cursor
