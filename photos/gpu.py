@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 WEB = Path(__file__).parent / "web"
-POOL_IDLE = 30  # seconds without GPU work, after which the texture pool is freed
+POOL_IDLE = 300  # seconds without GPU work, after which the texture pool (~1 GB) is freed; remaking it costs ~0.5 s
 _thread = ThreadPoolExecutor(1, thread_name_prefix="gpu")
 _gl: dict = {}
 # Free textures by (size, components, dtype), for reuse: new GPU memory is slow (on WSL

@@ -23,6 +23,7 @@ colour noise in gpu.py before the shader, which adds back some grain at step 2.
 from __future__ import annotations
 
 import io
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -385,8 +386,10 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
     full_preview() is what an export will be, shrunk.
     """
     rgb, color, _, full_size = _decode(data, half_size=True, denoise=False)
-    look = look_for(photo, data, rgb, color)
-    return _preview_blob(_shrink(rgb, long_side), None, color, look, full_size)
+    with ThreadPoolExecutor(1) as ex:  # the look fit and the shrink don't need each other, and mostly let go of the GIL
+        small = ex.submit(_shrink, rgb, long_side)
+        look = look_for(photo, data, rgb, color)
+        return _preview_blob(small.result(), None, color, look, full_size)
 
 
 def full_preview(full: "Full", long_side: int) -> bytes:
@@ -416,7 +419,10 @@ def _shrink(img: np.ndarray, long_side: int) -> np.ndarray:
     if size == (w, h):
         return img.astype(np.float32)
     shrink = lambda c: np.asarray(Image.fromarray(np.ascontiguousarray(c, np.float32)).resize(size, Image.Resampling.BOX))
-    return shrink(img) if img.ndim == 2 else np.stack([shrink(img[..., c]) for c in range(img.shape[2])], -1)
+    if img.ndim == 2:
+        return shrink(img)
+    with ThreadPoolExecutor(img.shape[2]) as ex:  # a channel per thread: PIL and numpy let go of the GIL
+        return np.stack(list(ex.map(lambda c: shrink(img[..., c]), range(img.shape[2]))), -1)
 
 
 def _preview_blob(rgb, grain, color: Color, look: Look, full_size) -> bytes:
