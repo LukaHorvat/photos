@@ -345,7 +345,7 @@ def _on_gpu(photo, data: bytes, denoise: bool, base: bool):
     size = (sizes.height, sizes.width) if flip & 4 else (sizes.width, sizes.height)
     pad = min(black, BLACK_PAD)
     to_cam = (saturation / 65535 / (saturation - black), pad / (saturation - black))  # as _decode
-    look = _looks.get(photo.path)
+    look = _looks.get((photo.path, denoise))
     jpeg = photo.embedded_jpeg(data) if look is None else None
     target = jpeg_target(size, jpeg) if jpeg else None
     decoded = gpu.demosaic(
@@ -355,7 +355,7 @@ def _on_gpu(photo, data: bytes, denoise: bool, base: bool):
     try:
         if look is None:
             samples = None if target is None else samples_at(decoded.look, target, color)
-            look = _looks[photo.path] = Look.from_samples(samples, photo.camera, photo.iso)
+            look = _looks[photo.path, denoise] = Look.from_samples(samples, photo.camera, photo.iso)
         noise = None
         if nlm is not None:
             noise = dn.Noise(dn.orient(decoded.removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(photo.iso))
@@ -365,13 +365,27 @@ def _on_gpu(photo, data: bytes, denoise: bool, base: bool):
         raise
 
 
-_looks: dict = {}  # path -> Look: fitted for the editor's preview, reused by the export
+# A photo's look is fitted from the full-size data an export develops (with noise reduction or
+# without), so an export comes out the same whether the editor ran first or not. The quick
+# preview fits a provisional one from its half-size data if that isn't there yet; the final
+# view replaces it.
+_looks: dict = {}  # (path, noise reduction on) -> Look
+_quick_looks: dict = {}  # path -> Look
 
 
-def look_for(photo, data: bytes, rgb: np.ndarray, color: Color) -> Look:
-    look = _looks.get(photo.path)
+def look_for(photo, data: bytes, rgb: np.ndarray, color: Color, denoise: bool) -> Look:
+    """The look, fitted from full-size `rgb` (with noise reduction if `denoise`) if it isn't yet."""
+    look = _looks.get((photo.path, denoise))
     if look is None:
-        look = _looks[photo.path] = Look.for_photo(rgb, color, photo.embedded_jpeg(data), photo.camera, photo.iso)
+        look = _looks[photo.path, denoise] = Look.for_photo(rgb, color, photo.embedded_jpeg(data), photo.camera, photo.iso)
+    return look
+
+
+def quick_look(photo, data: bytes, rgb: np.ndarray, color: Color) -> Look:
+    """For the quick preview: the photo's look if it's been fitted, else one from `rgb` (half size)."""
+    look = _looks.get((photo.path, False)) or _looks.get((photo.path, True)) or _quick_looks.get(photo.path)
+    if look is None:
+        look = _quick_looks[photo.path] = Look.for_photo(rgb, color, photo.embedded_jpeg(data), photo.camera, photo.iso)
     return look
 
 
@@ -388,7 +402,7 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
     rgb, color, _, full_size = _decode(data, half_size=True, denoise=False)
     with ThreadPoolExecutor(1) as ex:  # the look fit and the shrink don't need each other, and mostly let go of the GIL
         small = ex.submit(_shrink, rgb, long_side)
-        look = look_for(photo, data, rgb, color)
+        look = quick_look(photo, data, rgb, color)
         return _preview_blob(small.result(), None, color, look, full_size)
 
 
@@ -480,7 +494,7 @@ def full(photo, data: bytes, denoise: bool, previews=()) -> Full:
     on_gpu = _on_gpu(photo, data, denoise, base=False)
     if on_gpu is None:
         rgb, color, noise = decode_full(data, photo, denoise)
-        look = look_for(photo, data, rgb, color)
+        look = look_for(photo, data, rgb, color, denoise)
         if noise is None:
             return Full(rgb.astype(np.float16), None, color, look)
         decoded = gpu.upload(rgb)
@@ -504,10 +518,11 @@ def develop(photo, data: bytes, settings: dict) -> np.ndarray:
 
     s = clean(settings)
     compress = s["compress"] > 0  # else the shader doesn't read the base layer
-    on_gpu = _on_gpu(photo, data, denoise.active(s["noise"], photo.iso), base=compress)
+    nr = denoise.active(s["noise"], photo.iso)
+    on_gpu = _on_gpu(photo, data, nr, base=compress)
     if on_gpu is None:
-        rgb, color, noise = decode_full(data, photo, denoise.active(s["noise"], photo.iso))
-        look = look_for(photo, data, rgb, color)
+        rgb, color, noise = decode_full(data, photo, nr)
+        look = look_for(photo, data, rgb, color, nr)
         coeffs = base_coefficients(rgb, color) if compress else None
         decoded = gpu.upload(rgb)
     else:
