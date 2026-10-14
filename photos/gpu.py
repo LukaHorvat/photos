@@ -453,12 +453,28 @@ ROUND = """
     float r(float x) { return uintBitsToFloat(floatBitsToUint(x) ^ zero); }
     vec3 r(vec3 x) { return uintBitsToFloat(floatBitsToUint(x) ^ zero); }
 """
-# LibRaw's output (an RGBA16UI texture, oriented) as develop._decode turns it into camera RGB,
-# in float32 as numpy does it: a multiply, then a subtraction.
-TO_CAM = ROUND + """
-    uniform usampler2D rgb; uniform vec2 toCam;
-    vec3 camAt(ivec2 p) { return r(r(vec3(texelFetch(rgb, p, 0).rgb) * toCam.x) - toCam.y); }
-    uniform isampler2D bounds;  // _box_bounds() along x, one texel per output column
+# LibRaw's output as develop._decode turns it into camera RGB, in float32 as numpy does it: a
+# multiply, then a subtraction. toHalf: rounded to the nearest half float as numpy rounds, for
+# an RGBA16F texture (D3D12 truncates float32 to float16): to its step at that exponent, ties to even.
+CAMERA = ROUND + """
+    uniform vec2 toCam;
+    vec3 camera(ivec3 v) { return r(r(vec3(v) * toCam.x) - toCam.y); }
+    vec3 toHalf(vec3 x) {
+      ivec3 e = ivec3((floatBitsToUint(x) >> 23) & 255u) - 127;
+      vec3 step = exp2(vec3(max(e, -14) - 10));
+      return roundEven(x / step) * step;
+    }
+"""
+TO_CAM = CAMERA + """
+    uniform usampler2D rgb;  // LibRaw's output (ahd_combine), oriented
+    vec3 camAt(ivec2 p) { return camera(ivec3(texelFetch(rgb, p, 0).rgb)); }
+"""
+# PIL's BOX resize, which averages each output pixel's rows of input pixels, then the rows (in
+# doubles; here floats): what an output pixel averages, from _box_bounds() along x and y.
+BOX = """
+    uniform isampler2D boundsX; uniform isampler2D boundsY;
+    ivec2 boxX() { return texelFetch(boundsX, ivec2(int(gl_FragCoord.x), 0), 0).xy; }
+    ivec2 boxY() { return texelFetch(boundsY, ivec2(int(gl_FragCoord.y), 0), 0).xy; }
 """
 
 SHADERS.update({
@@ -532,9 +548,10 @@ SHADERS.update({
         }""",
     # ahd_interpolate_combine_homogeneous_pixels, and border_interpolate(5) for the 5-pixel
     # border, at the output's size: LibRaw's flip_index turns it.
-    "ahd_combine": AHD_RGB + """
+    "ahd_combine": AHD_RGB + CAMERA + """
         uniform usampler2D homo; uniform int flip;
-        out uvec4 rgbOut;
+        layout(location = 0) out uvec4 rgbOut;  // LibRaw's output
+        layout(location = 1) out vec4 cam;      // camera RGB, as develop._decode makes it of that
         void main() {
           ivec2 size = textureSize(mosaic, 0), o = ivec2(gl_FragCoord.xy);
           int row = o.y, col = o.x;
@@ -566,52 +583,47 @@ SHADERS.update({
             for (int c = 0; c < 3; c++) rgb[c] = c == f ? M(p) : int(uint(sum[c]) / uint(max(n[c], 1)));
           }
           rgbOut = uvec4(uvec3(rgb), 0u);
+          cam = vec4(toHalf(camera(rgb)), 0.0);
         }""",
-    # Into an RGBA16F texture, rounded to the nearest half float as numpy rounds (D3D12 writes
-    # float32 to float16 truncated): to the half float's step at that exponent, ties to even.
-    "rgb_cam": TO_CAM + """
-        out vec4 cam;
-        vec3 toHalf(vec3 x) {
-          ivec3 e = ivec3((floatBitsToUint(x) >> 23) & 255u) - 127;
-          vec3 step = exp2(vec3(max(e, -14) - 10));
-          return roundEven(x / step) * step;
-        }
-        void main() { cam = vec4(toHalf(camAt(ivec2(gl_FragCoord.xy))), 0.0); }""",
-    # PIL's BOX resize, along x then along y; averages in float32 (PIL: doubles).
-    "box_cam": TO_CAM + """
+    # Camera RGB averaged down (box_cam) for the look, luminance (box_luminance) for the base
+    # layer, a float texture (box_texture) for the editor's preview.
+    "box_cam": TO_CAM + BOX + """
         out vec4 v;
         void main() {
-          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.x, 0), 0).xy;
+          ivec2 bx = boxX(), by = boxY();
           vec3 s = vec3(0.0);
-          for (int x = b.x; x < b.y; x++) s += camAt(ivec2(x, p.y));
-          v = vec4(s / float(b.y - b.x), 0.0);
+          for (int y = by.x; y < by.y; y++) {
+            vec3 row = vec3(0.0);
+            for (int x = bx.x; x < bx.y; x++) row += camAt(ivec2(x, y));
+            s += row / float(bx.y - bx.x);
+          }
+          v = vec4(s / float(by.y - by.x), 0.0);
         }""",
-    "box_luminance": TO_CAM + """
+    "box_luminance": TO_CAM + BOX + """
         uniform vec3 mul; uniform vec3 weights;
         out float v;
         void main() {
-          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.x, 0), 0).xy;
+          ivec2 bx = boxX(), by = boxY();
           float clipLevel = min(mul.r, min(mul.g, mul.b)), s = 0.0;
-          for (int x = b.x; x < b.y; x++) s += dot(min(camAt(ivec2(x, p.y)) * mul, vec3(clipLevel)), weights);
-          v = s / float(b.y - b.x);
+          for (int y = by.x; y < by.y; y++) {
+            float row = 0.0;
+            for (int x = bx.x; x < bx.y; x++) row += dot(min(camAt(ivec2(x, y)) * mul, vec3(clipLevel)), weights);
+            s += row / float(bx.y - bx.x);
+          }
+          v = s / float(by.y - by.x);
         }""",
-    "box_rows": """
-        uniform sampler2D src; uniform isampler2D bounds;
+    "box_texture": BOX + """
+        uniform sampler2D src;
         out vec4 v;
         void main() {
-          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.x, 0), 0).xy;
+          ivec2 bx = boxX(), by = boxY();
           vec4 s = vec4(0.0);
-          for (int x = b.x; x < b.y; x++) s += texelFetch(src, ivec2(x, p.y), 0);
-          v = s / float(b.y - b.x);
-        }""",
-    "box_columns": """
-        uniform sampler2D src; uniform isampler2D bounds;  // along y, one texel per output row
-        out vec4 v;
-        void main() {
-          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.y, 0), 0).xy;
-          vec4 s = vec4(0.0);
-          for (int y = b.x; y < b.y; y++) s += texelFetch(src, ivec2(p.x, y), 0);
-          v = s / float(b.y - b.x);
+          for (int y = by.x; y < by.y; y++) {
+            vec4 row = vec4(0.0);
+            for (int x = bx.x; x < bx.y; x++) row += texelFetch(src, ivec2(x, y), 0);
+            s += row / float(bx.y - bx.x);
+          }
+          v = s / float(by.y - by.x);
         }""",
 })
 
@@ -894,9 +906,8 @@ def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, 
         lab = {"mosaic": scaled, "green": green, "cbrtTable": cbrt}
         _pass("ahd_lab", fb(lab_h, lab_v), lab, pat=pat, xc0=xyz[:, 0], xc1=xyz[:, 1], xc2=xyz[:, 2])
         _pass("ahd_homo", fb(homo), {"labH": lab_h, "labV": lab_v})
-        _pass("ahd_combine", fb(rgb), {"mosaic": scaled, "green": green, "homo": homo}, pat=pat, flip=flip)
         cam = _texture(out, 4, dtype="f2")
-        _pass("rgb_cam", fb(cam), {"rgb": rgb}, toCam=to_cam)
+        _pass("ahd_combine", fb(rgb, cam), {"mosaic": scaled, "green": green, "homo": homo}, pat=pat, flip=flip, toCam=to_cam)
         decoded = Decoded(out[0], out[1], cam, removed=removed)
         if look is not None:
             look_size, box = look
@@ -914,19 +925,18 @@ def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, 
 
 
 def _resize(shader: str, source: dict, in_size, size, box, components: int, **uniforms) -> np.ndarray:
-    """PIL's BOX resize of what `shader` (box_rows, box_cam, box_luminance) makes of its
+    """PIL's BOX resize of what `shader` (box_cam, box_luminance, box_texture) makes of its
     `source` texture (in_size), over `box`, down to `size`: float32, height x width x components."""
     ctx = _setup()["ctx"]
     (w, h), (ow, oh), (x0, y0, x1, y1) = in_size, size, box
     bx, by = _texture((ow, 1), 2, _box_bounds(w, x0, x1, ow), dtype="i4"), _texture((oh, 1), 2, _box_bounds(h, y0, y1, oh), dtype="i4")
-    rows, small = _texture((ow, h), 4 if components > 1 else 1), _texture((ow, oh), 4 if components > 1 else 1)
-    fbs = [ctx.framebuffer([rows]), ctx.framebuffer([small])]
+    small = _texture((ow, oh), 4 if components > 1 else 1)
+    fb = ctx.framebuffer([small])
     try:
-        _pass(shader, fbs[0], {**source, "bounds": bx}, **uniforms)
-        _pass("box_columns", fbs[1], {"src": rows, "bounds": by})
-        return _read(fbs[1], components=components, dtype="f4").view(np.float32).reshape(oh, ow, components)
+        _pass(shader, fb, {**source, "boundsX": bx, "boundsY": by}, **uniforms)
+        return _read(fb, components=components, dtype="f4").view(np.float32).reshape(oh, ow, components)
     finally:
-        _release(bx, by, rows, small, *fbs)
+        _release(bx, by, small, fb)
 
 
 def _chroma_nr(cam, size, mul, rgb_cam):
@@ -991,7 +1001,7 @@ def _read_cam(cam, noise, removed, shrink) -> tuple:
         small = {}
         for size in shrink:
             box = (0, 0, *cam.size)
-            small[size] = _resize("box_rows", {"src": cam}, cam.size, size, box, 3), None if grain is None else _resize("box_rows", {"src": grain}, cam.size, size, box, 1)[..., 0]
+            small[size] = _resize("box_texture", {"src": cam}, cam.size, size, box, 3), None if grain is None else _resize("box_texture", {"src": grain}, cam.size, size, box, 1)[..., 0]
         return _read(cam), None if grain is None else _read(grain), small
     finally:
         _release(*owned)
