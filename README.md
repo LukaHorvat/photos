@@ -3,9 +3,9 @@
 Personal raw-photo workflow tool: pick, develop, export.
 
 ```sh
-uv run photos cull /mnt/d/Radno     # opens the picker
-uv run photos edit /mnt/d/Radno     # opens the editor (same app, E switches between them)
-uv run photos export /mnt/d/Radno   # develops every kept photo to /mnt/d/Radno/export
+uv run photos cull <folder>     # opens the picker
+uv run photos edit <folder>     # opens the editor (same app, E switches between them)
+uv run photos export <folder>   # develops every kept photo to <folder>/export
 ```
 
 The UI runs in the Windows browser; press `?` in it for keys.
@@ -28,7 +28,8 @@ the same on everyone, its warmth and saturation aren't. One shader
 (`web/develop.frag`) does it, in the browser for the preview, so sliders respond
 instantly, and on the server's GPU for exports, so an export is what the editor
 showed. At full size the raw is demosaiced on the GPU too: LibRaw's own AHD, ported to
-give the same result to the bit, ~10x faster than LibRaw runs it.
+give the same result to the bit, ~10x faster than LibRaw runs it. A batch export takes
+~0.5 s per photo.
 
 Unedited, a photo looks like the camera's own JPEG (`look.py`): its tone curve is
 fitted to the JPEG embedded in that raw (the camera adapts it per scene), and
@@ -36,7 +37,7 @@ colour comes from a profile per camera model in `photos/profiles/`, fitted from
 raw + JPEG pairs:
 
 ```sh
-uv run python scripts/calibrate_camera.py /mnt/d/Radno
+uv run python scripts/calibrate_camera.py <folder>
 ```
 
 Noise reduction works like the camera's (`denoise.py`): non-local means on the
@@ -52,7 +53,7 @@ the profile also holds the camera's typical noise per ISO, and a photo measuring
 more than 1.5x that is denoised as typical:
 
 ```sh
-uv run python scripts/calibrate_noise.py /mnt/d/Radno
+uv run python scripts/calibrate_noise.py <folder>
 ```
 
 The editor shows what the export will be. The server prepares the export's own
