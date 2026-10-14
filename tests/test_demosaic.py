@@ -80,7 +80,7 @@ def test_demosaic_is_librarys_ahd(gpu):
     for flip in (0, 3, 5, 6):
         d = gpu.demosaic(mosaic, PATTERN, black - 22, saturation, flip, D3500, to_cam)
         try:
-            cam, _ = gpu.read_decoded(d)
+            cam, _, _ = gpu.read_decoded(d)
         finally:
             d.release()
         rgb = expected.astype(np.float32)
@@ -109,3 +109,17 @@ def test_demosaic_averages_down_like_pil(gpu):
         assert np.allclose(d.look, pil, rtol=1e-5, atol=0)  # PIL adds up in doubles, the GPU in floats
         lum = np.minimum(rgb * mul, mul.min()) @ weights
         assert np.allclose(d.base, np.asarray(Image.fromarray(lum).resize((23, 15), Image.Resampling.BOX)), rtol=1e-5, atol=0)
+
+
+def test_shrinking_on_the_gpu_is_develops_shrink(gpu):
+    from photos import develop
+
+    rng = np.random.default_rng(5)
+    rgb = rng.uniform(-0.01, 1.0, (70, 103, 3)).astype(np.float16).astype(np.float32)
+    d = gpu.upload(rgb)
+    try:
+        _, _, small = gpu.read_decoded(d, shrink=[(40, 27)])
+    finally:
+        d.release()
+    assert develop._shrunk_size(103, 70, 40) == (40, 27)
+    assert np.allclose(small[(40, 27)][0], develop._shrink(rgb, 40), rtol=1e-5, atol=1e-7)

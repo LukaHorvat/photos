@@ -128,8 +128,9 @@ class Library:
         # views: ~200 MB and 1.5-3 s of work each, for the photo on screen and the next (which
         # waits for it). Two at a time, so a change to the photo on screen needn't wait for the next.
         self.fulls = Prefetcher(
-            lambda key: develop.full(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=2, keep=4
+            lambda key: develop.full(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1], [self.preview_side]), workers=2, keep=4
         )
+        self.preview_side = 2048  # the editor's preview size, as it last asked: fulls make that full_preview too
         self.state_path = folder / STATE_FILE
         self.state = self._load()
         self._save_lock = threading.Lock()
@@ -428,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if self.path == "/api/develop-hint":
             # names[0] is on screen, then the next, then others nearby; noise: their settings
-            size = preview_size(int(body.get("w", 0)))
+            size = self.lib.preview_side = preview_size(int(body.get("w", 0)))
             self.lib.previews.want([(n, size) for n in raws])
             noise = [str(v) for v in body.get("noise", [])] + [None, None]
             self.lib.fulls.want([self.lib.full_key(n, v) for n, v in zip(raws[:2], noise)])

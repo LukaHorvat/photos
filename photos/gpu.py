@@ -101,14 +101,17 @@ def render_decoded(decoded: Decoded, coeffs, uniforms, tone, table, noise=None) 
     return _run(_render, decoded.cam, _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain)
 
 
-def read_decoded(decoded: Decoded, noise=None) -> tuple[np.ndarray, np.ndarray | None]:
+def read_decoded(decoded: Decoded, noise=None, shrink=()) -> tuple[np.ndarray, np.ndarray | None, dict]:
     """What render_decoded() feeds the develop shader, read back: camera RGB (HxWx4 float16),
     with `noise` its colour noise smoothed, and the grain to give back (HxW float16) or None.
-    The editor's 100% view runs the shader on these in the browser, so it shows the export."""
+    The editor's 100% view runs the shader on these in the browser, so it shows the export.
+
+    And for each (width, height) in `shrink`, both averaged down to it as PIL's BOX resize does
+    it (develop._shrink): {size: (camera RGB, grain or None)}, float32."""
     h, w = decoded.height, decoded.width
     grain = None if noise is None else _f32(noise.grain)
-    cam, grain = _run(_read_cam, decoded.cam, noise, grain)
-    return np.frombuffer(cam, np.float16).reshape(h, w, 4), None if grain is None else np.frombuffer(grain, np.float16).reshape(h, w)
+    cam, grain, small = _run(_read_cam, decoded.cam, noise, grain, tuple(shrink))
+    return np.frombuffer(cam, np.float16).reshape(h, w, 4), None if grain is None else np.frombuffer(grain, np.float16).reshape(h, w), small
 
 
 def _rgba16(rgb) -> np.ndarray:
@@ -592,6 +595,15 @@ SHADERS.update({
           for (int x = b.x; x < b.y; x++) s += dot(min(camAt(ivec2(x, p.y)) * mul, vec3(clipLevel)), weights);
           v = s / float(b.y - b.x);
         }""",
+    "box_rows": """
+        uniform sampler2D src; uniform isampler2D bounds;
+        out vec4 v;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.x, 0), 0).xy;
+          vec4 s = vec4(0.0);
+          for (int x = b.x; x < b.y; x++) s += texelFetch(src, ivec2(x, p.y), 0);
+          v = s / float(b.y - b.x);
+        }""",
     "box_columns": """
         uniform sampler2D src; uniform isampler2D bounds;  // along y, one texel per output row
         out vec4 v;
@@ -846,10 +858,10 @@ def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, 
         decoded = Decoded(out[0], out[1], cam, removed=removed)
         if look is not None:
             look_size, box = look
-            decoded.look = _resize(rgb, out, look_size, box, "box_cam", 3, toCam=to_cam)
+            decoded.look = _resize("box_cam", {"rgb": rgb}, out, look_size, box, 3, toCam=to_cam)
         if base is not None:
             mul, weights, base_size = base
-            decoded.base = _resize(rgb, out, base_size, (0, 0, *out), "box_luminance", 1, toCam=to_cam, mul=mul, weights=weights)[..., 0]
+            decoded.base = _resize("box_luminance", {"rgb": rgb}, out, base_size, (0, 0, *out), 1, toCam=to_cam, mul=mul, weights=weights)[..., 0]
         return decoded
     except BaseException:
         if cam is not None:
@@ -859,16 +871,16 @@ def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, 
         _release(*owned)
 
 
-def _resize(rgb, in_size, size, box, shader: str, components: int, **uniforms) -> np.ndarray:
-    """PIL's BOX resize of what `shader` makes of LibRaw's output in texture `rgb` (in_size),
-    over `box`, down to `size`: float32, height x width x components."""
+def _resize(shader: str, source: dict, in_size, size, box, components: int, **uniforms) -> np.ndarray:
+    """PIL's BOX resize of what `shader` (box_rows, box_cam, box_luminance) makes of its
+    `source` texture (in_size), over `box`, down to `size`: float32, height x width x components."""
     ctx = _setup()["ctx"]
     (w, h), (ow, oh), (x0, y0, x1, y1) = in_size, size, box
     bx, by = _texture((ow, 1), 2, _box_bounds(w, x0, x1, ow), dtype="i4"), _texture((oh, 1), 2, _box_bounds(h, y0, y1, oh), dtype="i4")
     rows, small = _texture((ow, h), 4 if components > 1 else 1), _texture((ow, oh), 4 if components > 1 else 1)
     fbs = [ctx.framebuffer([rows]), ctx.framebuffer([small])]
     try:
-        _pass(shader, fbs[0], {"rgb": rgb, "bounds": bx}, **uniforms)
+        _pass(shader, fbs[0], {**source, "bounds": bx}, **uniforms)
         _pass("box_columns", fbs[1], {"src": rows, "bounds": by})
         return _read(fbs[1], components=components, dtype="f4").view(np.float32).reshape(oh, ow, components)
     finally:
@@ -929,14 +941,18 @@ def _with_noise(cam, noise, removed, size) -> tuple:
     return smoothed, _grain(removed, noise.weights, size)
 
 
-def _read_cam(cam, noise, removed) -> tuple[bytes, bytes | None]:
-    if noise is None:
-        return _read(cam), None
-    smoothed, grain = _with_noise(cam, noise, removed, cam.size)
+def _read_cam(cam, noise, removed, shrink) -> tuple:
+    grain, owned = None, []
+    if noise is not None:
+        cam, grain = owned = _with_noise(cam, noise, removed, cam.size)
     try:
-        return _read(smoothed), _read(grain)
+        small = {}
+        for size in shrink:
+            box = (0, 0, *cam.size)
+            small[size] = _resize("box_rows", {"src": cam}, cam.size, size, box, 3), None if grain is None else _resize("box_rows", {"src": grain}, cam.size, size, box, 1)[..., 0]
+        return _read(cam), None if grain is None else _read(grain), small
     finally:
-        _release(smoothed, grain)
+        _release(*owned)
 
 
 def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:

@@ -403,13 +403,18 @@ def full_preview(full: "Full", long_side: int) -> bytes:
     return full.previews[long_side]
 
 
+def _shrunk_size(w: int, h: int, long_side: int) -> tuple[int, int]:
+    """(width, height) of w x h shrunk to fit long_side (never enlarged)."""
+    scale = min(1.0, long_side / max(h, w))
+    return (w, h) if scale == 1 else (max(1, round(w * scale)), max(1, round(h * scale)))
+
+
 def _shrink(img: np.ndarray, long_side: int) -> np.ndarray:
     """Averaged down (in linear light) to fit long_side, float32."""
     h, w = img.shape[:2]
-    scale = min(1.0, long_side / max(h, w))
-    if scale == 1:
+    size = _shrunk_size(w, h, long_side)
+    if size == (w, h):
         return img.astype(np.float32)
-    size = (max(1, round(w * scale)), max(1, round(h * scale)))
     shrink = lambda c: np.asarray(Image.fromarray(np.ascontiguousarray(c, np.float32)).resize(size, Image.Resampling.BOX))
     return shrink(img) if img.ndim == 2 else np.stack([shrink(img[..., c]) for c in range(img.shape[2])], -1)
 
@@ -461,7 +466,9 @@ class Full:
         return cam.tobytes() + grain.tobytes()
 
 
-def full(photo, data: bytes, denoise: bool) -> Full:
+def full(photo, data: bytes, denoise: bool, previews=()) -> Full:
+    """The export's input for the editor, with its full_preview() at each long side in
+    `previews` made already (averaged down on the GPU, ~0.3 s quicker than from the Full)."""
     from . import gpu
 
     on_gpu = _on_gpu(photo, data, denoise, base=False)
@@ -473,11 +480,16 @@ def full(photo, data: bytes, denoise: bool) -> Full:
         decoded = gpu.upload(rgb)
     else:
         decoded, color, noise, look, _ = on_gpu
+    w, h = decoded.width, decoded.height
+    sizes = {s: _shrunk_size(w, h, s) for s in previews if _shrunk_size(w, h, s) != (w, h)}
     try:
-        cam, grain = gpu.read_decoded(decoded, noise)
+        cam, grain, small = gpu.read_decoded(decoded, noise, set(sizes.values()))
     finally:
         decoded.release()
-    return Full(cam[..., :3], grain, color, look)
+    out = Full(cam[..., :3], grain, color, look)
+    for long_side, size in sizes.items():
+        out.previews[long_side] = _preview_blob(*small[size], color, look, (w, h))
+    return out
 
 
 def develop(photo, data: bytes, settings: dict) -> np.ndarray:
