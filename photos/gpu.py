@@ -98,7 +98,10 @@ def render_decoded(decoded: Decoded, coeffs, uniforms, tone, table, noise=None) 
     Conversions happen here, on the caller's thread, so the GL thread only does GL work
     (it is shared by all exports)."""
     grain = None if noise is None else _f32(noise.grain)
-    return _run(_render, decoded.cam, _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain)
+    out = _run(_render, decoded.cam, _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain)
+    # GL reads the bottom row first. Drawing upside down instead would need a vertex shader
+    # of its own, and change a few pixels by a bit (sampling positions computed differently).
+    return np.ascontiguousarray(out[::-1])
 
 
 def read_decoded(decoded: Decoded, noise=None, shrink=()) -> tuple[np.ndarray, np.ndarray | None, dict]:
@@ -628,17 +631,6 @@ SHADERS.update({
 })
 
 
-# web/develop.vert upside down: GL reads a framebuffer bottom row first, so renders come back
-# top row first, ready to save.
-EXPORT_VERTEX = """#version 300 es
-in vec2 pos;
-out vec2 uv;
-void main() {
-  uv = pos * 0.5 + 0.5;
-  gl_Position = vec4(pos, 0.0, 1.0);
-}"""
-
-
 def _setup() -> dict:
     if not _gl:
         import moderngl
@@ -647,7 +639,10 @@ def _setup() -> dict:
             ctx = moderngl.create_standalone_context(backend="egl")
         except Exception as e:
             raise RuntimeError(f"Exports need OpenGL through EGL (Mesa's libegl1): {e}") from e
-        prog = ctx.program(vertex_shader=EXPORT_VERTEX, fragment_shader=(WEB / "develop.frag").read_text())
+        prog = ctx.program(
+            vertex_shader=(WEB / "develop.vert").read_text(),
+            fragment_shader=(WEB / "develop.frag").read_text(),
+        )
         quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], "f4").tobytes())
         _gl.update(ctx=ctx, prog=prog, quad=quad, vao=ctx.vertex_array(prog, [(quad, "2f", "pos")]), passes={})
         _gl["c"] = _gl_functions()
@@ -1008,7 +1003,7 @@ def _read_cam(cam, noise, removed, shrink) -> tuple:
 
 
 def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
-    """sRGB, HxWx3 uint8 (top row first: EXPORT_VERTEX), from the camera RGB texture `cam`."""
+    """sRGB, HxWx3 uint8, bottom row first, from the camera RGB texture `cam`."""
     import moderngl
 
     gl = _setup()
