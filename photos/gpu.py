@@ -230,7 +230,7 @@ def _run(fn, *args):
 def _trim(job: int):
     if job == _latest:
         for tex in itertools.chain.from_iterable(_pool.values()):
-            tex.release()
+            _delete(tex)
         _pool.clear()
 
 
@@ -653,7 +653,8 @@ def _gl_functions():
     for lib in ("libGL.so.1", "libOpenGL.so.0"):
         try:
             gl = ctypes.CDLL(lib)
-            gl.glFinish, gl.glPixelStorei, gl.glReadPixels, gl.glGetTexImage, gl.glTexSubImage2D  # all there?
+            gl.glFinish, gl.glPixelStorei, gl.glReadPixels, gl.glGetTexImage, gl.glTexSubImage2D, gl.glTexImage2D  # all there?
+            gl.glGenTextures, gl.glDeleteTextures, gl.glBindTexture, gl.glTexParameteri
             return gl
         except (OSError, AttributeError):
             continue
@@ -691,6 +692,47 @@ def _read(obj, components: int | None = None, dtype: str = "f1") -> np.ndarray:
         obj.use()
         gl["c"].glReadPixels(0, 0, w, h, fmt, typ, ptr)
     return out
+
+
+# GL's internal formats by moderngl dtype, for 1 to 4 components
+_INTERNAL = {
+    "f1": (0x8229, 0x822B, 0x8051, 0x8058),
+    "f2": (0x822D, 0x822F, 0x881B, 0x881A),
+    "f4": (0x822E, 0x8230, 0x8815, 0x8814),
+    "u1": (0x8232, 0x8238, 0x8D7D, 0x8D7C),
+    "u2": (0x8234, 0x823A, 0x8D77, 0x8D76),
+    "u4": (0x8236, 0x823C, 0x8D71, 0x8D70),
+    "i1": (0x8231, 0x8237, 0x8D8F, 0x8D8E),
+    "i2": (0x8233, 0x8239, 0x8D89, 0x8D88),
+    "i4": (0x8235, 0x823B, 0x8D83, 0x8D82),
+}
+
+
+def _new_texture(size, components: int, dtype: str):
+    """A new texture, made through ctypes (see _gl_functions): the driver can take ~0.2 s to
+    find the memory for a full-size one, with moderngl holding the GIL. moderngl doesn't
+    delete textures it didn't make: _delete() does."""
+    import ctypes
+
+    gl = _setup()
+    if gl["c"] is None:
+        return gl["ctx"].texture(size, components, dtype=dtype)
+    c, name = gl["c"], ctypes.c_uint(0)
+    c.glGenTextures(1, ctypes.byref(name))
+    c.glBindTexture(GL_TEXTURE_2D, name.value)
+    fmt = _FORMATS[components][dtype[0] in "ui"]
+    c.glTexImage2D(GL_TEXTURE_2D, 0, _INTERNAL[dtype][components - 1], int(size[0]), int(size[1]), 0, fmt, _TYPES[dtype], None)
+    c.glTexParameteri(GL_TEXTURE_2D, 0x813D, 0)  # GL_TEXTURE_MAX_LEVEL: no mipmaps
+    return gl["ctx"].external_texture(name.value, size, components, 0, dtype)
+
+
+def _delete(tex):
+    import ctypes
+
+    c = _setup()["c"]
+    if c is not None:
+        c.glDeleteTextures(1, ctypes.byref(ctypes.c_uint(tex.glo)))
+    tex.release()
 
 
 def _write(tex, data):
@@ -732,7 +774,7 @@ def _texture(size, components, data=None, dtype="f4", linear=False):
     import moderngl
 
     free = _pool.get((tuple(size), components, dtype))
-    tex = free.pop() if free else _setup()["ctx"].texture(size, components, dtype=dtype)
+    tex = free.pop() if free else _new_texture(tuple(size), components, dtype)
     if data is not None:
         _write(tex, data)
     tex.filter = (moderngl.LINEAR, moderngl.LINEAR) if linear else (moderngl.NEAREST, moderngl.NEAREST)
