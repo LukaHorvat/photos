@@ -3,7 +3,8 @@
 The pipeline itself is web/develop.frag. It runs in the browser for the editor's
 preview, so sliders respond instantly, and on the server (gpu.py) for exports, so an
 export is what the editor showed. This module decodes raws into linear camera RGB and
-works out everything else the shader needs.
+works out everything else the shader needs. LibRaw unpacks the raw data; at full size the
+GPU demosaics it (gpu.demosaic, LibRaw's own AHD to the bit) and keeps it for the shader.
 
 The pipeline, in order:
   1. white balance: colour temperature (Kelvin) -> camera RGB multipliers
@@ -28,7 +29,7 @@ import numpy as np
 import rawpy
 from PIL import Image
 
-from .look import GRID, LUMA, Look, load_profile
+from .look import GRID, LUMA, Look, jpeg_target, load_profile, samples_at
 
 # temp None: as shot. tint 0: the camera's. noise None: automatic (denoise.active), else 0 off, 100 on.
 DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "tint": 0, "saturation": 0, "contrast": 0, "noise": None}
@@ -218,15 +219,27 @@ def base_coefficients(rgb_cam: np.ndarray, color: Color) -> np.ndarray:
     Computed once per photo from the as-shot rendering.
     """
     h, w = rgb_cam.shape[:2]
-    scale = BASE_LONG_SIDE / max(h, w)
-    lh, lw = max(1, round(h * scale)), max(1, round(w * scale))
     # Linear luminance at the as-shot white balance (one weighted sum per pixel), averaged
     # down to the base layer's size, then logged. Averaging linear light gives the same
     # result whatever size it starts from, so the editor's preview and an export agree.
-    mul = color.as_shot.astype(np.float32)
-    weights = (color.rgb_cam.T @ LUMA).astype(np.float32)
+    mul, weights = base_luminance(color)
     lum = np.minimum(rgb_cam * mul, mul.min()) @ weights
-    small = np.asarray(Image.fromarray(lum).resize((lw, lh), Image.Resampling.BOX))
+    return coefficients(np.asarray(Image.fromarray(lum).resize(base_size(w, h), Image.Resampling.BOX)))
+
+
+def base_luminance(color: Color) -> tuple[np.ndarray, np.ndarray]:
+    """The base layer's luminance: min(rgb * mul, min(mul)) @ weights (float32)."""
+    return color.as_shot.astype(np.float32), (color.rgb_cam.T @ LUMA).astype(np.float32)
+
+
+def base_size(w: int, h: int) -> tuple[int, int]:
+    """(width, height) the base layer is worked out at."""
+    scale = BASE_LONG_SIDE / max(h, w)
+    return max(1, round(w * scale)), max(1, round(h * scale))
+
+
+def coefficients(small: np.ndarray) -> np.ndarray:
+    """base_coefficients() from the luminance averaged down to base_size()."""
     guide = np.log2(np.maximum(small, LOG_FLOOR)).astype(np.float32)
     r, eps = BASE_RADIUS, BASE_EPS
     mean = _box(guide, r)
@@ -301,6 +314,54 @@ def _decode(data: bytes, half_size: bool, denoise: bool, iso: int | None = None,
     if removed is not None:
         noise = dn.Noise(dn.orient(removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(iso))
     return rgb, color, noise, full_size
+
+
+def _on_gpu(photo, data: bytes, denoise: bool, base: bool):
+    """decode_full() demosaiced on the GPU (gpu.demosaic: the same result, to the bit, without
+    LibRaw's slow demosaicing and the copies around it), left there as the develop shader's
+    input; the photo's look fitted (if it isn't yet) and with `base`, the base layer worked
+    out, from what the GPU averages down. Returns (gpu.Decoded, color, noise, look, base
+    coefficients or None), or None for a raw LibRaw has to demosaic (not a plain Bayer mosaic)."""
+    from . import denoise as dn
+    from . import gpu
+
+    with rawpy.imread(io.BytesIO(data)) as raw:
+        sizes = raw.sizes
+        black_levels = set(raw.black_level_per_channel)
+        if not dn.supported(raw) or raw.num_colors != 3 or len(black_levels) != 1 or sizes.pixel_aspect != 1:
+            return None
+        color = Color.from_raw(raw)
+        black = black_levels.pop()
+        top = int(raw.raw_image_visible.max())
+        saturation = top if top >= 0.98 * raw.white_level else raw.white_level  # as _decode
+        nlm, gain = None, 1
+        if denoise:
+            typical = load_profile(photo.camera).noise_at(photo.iso)
+            nlm = dn.nlm_args(raw, black, 1 / (saturation - black), color, typical)
+            gain = nlm[-1]
+        mosaic, pattern, cam_xyz = raw.raw_image_visible.copy(), np.asarray(raw.raw_pattern), raw.rgb_xyz_matrix
+    flip = sizes.flip
+    size = (sizes.height, sizes.width) if flip & 4 else (sizes.width, sizes.height)
+    pad = min(black, BLACK_PAD)
+    to_cam = (saturation / 65535 / (saturation - black), pad / (saturation - black))  # as _decode
+    look = _looks.get(photo.path)
+    jpeg = photo.embedded_jpeg(data) if look is None else None
+    target = jpeg_target(size, jpeg) if jpeg else None
+    decoded = gpu.demosaic(
+        mosaic, pattern, gain * (black - pad), gain * saturation, flip, cam_xyz, to_cam, nlm=nlm,
+        look=None if target is None else (target.size, target.box), base=(*base_luminance(color), base_size(*size)) if base else None,
+    )
+    try:
+        if look is None:
+            samples = None if target is None else samples_at(decoded.look, target, color)
+            look = _looks[photo.path] = Look.from_samples(samples, photo.camera, photo.iso)
+        noise = None
+        if nlm is not None:
+            noise = dn.Noise(dn.orient(decoded.removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(photo.iso))
+        return decoded, color, noise, look, None if decoded.base is None else coefficients(decoded.base)
+    except BaseException:
+        decoded.release()
+        raise
 
 
 _looks: dict = {}  # path -> Look: fitted for the editor's preview, reused by the export
@@ -385,7 +446,7 @@ class Full:
     (in tiles) and its final whole-photo view (full_preview). The browser runs the shader on
     it, so both show what the export will."""
 
-    cam: np.ndarray  # camera RGB (after noise reduction, if any), H x W x 3 float16
+    cam: np.ndarray  # camera RGB (after noise reduction, if any), H x W x 3 float16 (may be a view)
     grain: np.ndarray | None  # grain given back after noise reduction, H x W float16
     color: Color
     look: Look
@@ -403,19 +464,38 @@ class Full:
 def full(photo, data: bytes, denoise: bool) -> Full:
     from . import gpu
 
-    rgb, color, noise = decode_full(data, photo, denoise)
-    look = look_for(photo, data, rgb, color)
-    if noise is None:
-        return Full(rgb.astype(np.float16), None, color, look)
-    cam, grain = gpu.denoised(rgb, noise)
-    return Full(np.ascontiguousarray(cam[..., :3]), grain, color, look)
+    on_gpu = _on_gpu(photo, data, denoise, base=False)
+    if on_gpu is None:
+        rgb, color, noise = decode_full(data, photo, denoise)
+        look = look_for(photo, data, rgb, color)
+        if noise is None:
+            return Full(rgb.astype(np.float16), None, color, look)
+        decoded = gpu.upload(rgb)
+    else:
+        decoded, color, noise, look, _ = on_gpu
+    try:
+        cam, grain = gpu.read_decoded(decoded, noise)
+    finally:
+        decoded.release()
+    return Full(cam[..., :3], grain, color, look)
 
 
 def develop(photo, data: bytes, settings: dict) -> np.ndarray:
     """A whole raw file, developed at full size -> sRGB uint8 (HxWx3)."""
     from . import denoise, gpu
 
-    rgb, color, noise = decode_full(data, photo, denoise.active(clean(settings)["noise"], photo.iso))
-    look = look_for(photo, data, rgb, color)
-    coeffs = base_coefficients(rgb, color)
-    return gpu.render(rgb, coeffs, uniforms(color, look, settings), *look_textures(look), noise=noise)
+    s = clean(settings)
+    compress = s["compress"] > 0  # else the shader doesn't read the base layer
+    on_gpu = _on_gpu(photo, data, denoise.active(s["noise"], photo.iso), base=compress)
+    if on_gpu is None:
+        rgb, color, noise = decode_full(data, photo, denoise.active(s["noise"], photo.iso))
+        look = look_for(photo, data, rgb, color)
+        coeffs = base_coefficients(rgb, color) if compress else None
+        decoded = gpu.upload(rgb)
+    else:
+        decoded, color, noise, look, coeffs = on_gpu
+    try:
+        coeffs = np.zeros((1, 1, 2), np.float32) if coeffs is None else coeffs
+        return gpu.render_decoded(decoded, coeffs, uniforms(color, look, s), *look_textures(look), noise=noise)
+    finally:
+        decoded.release()

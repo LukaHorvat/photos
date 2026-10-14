@@ -1,11 +1,14 @@
-"""GPU work on the server: the develop shader for exports, and noise reduction.
+"""GPU work on the server: demosaicing, the develop shader for exports, and noise reduction.
 
 The develop shader (web/develop.frag) also renders the editor's preview in the browser,
 so an export looks like what you saw. Noise reduction (see denoise.py) only runs here:
 non-local means on the raw planes, and after demosaicing a guided filter for colour
-noise and the grain given back. Everything runs on the GPU when Mesa can reach one (on
-WSL, through D3D12) and on Mesa's software renderer otherwise. A GL context belongs to
-one thread at a time, so all GL work happens on a single thread of its own.
+noise and the grain given back. Demosaicing is LibRaw's AHD, ported to give the same
+result to the bit, ~10x faster than LibRaw's own; the camera RGB stays on the GPU for
+the develop shader, and only what the CPU needs comes back. Everything runs on the GPU
+when Mesa can reach one (on WSL, through D3D12) and on Mesa's software renderer
+otherwise. A GL context belongs to one thread at a time, so all GL work happens on a
+single thread of its own.
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from __future__ import annotations
 import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -28,25 +33,82 @@ _jobs = itertools.count(1)
 _latest = 0
 
 
+@dataclass
+class Decoded:
+    """Camera RGB on the GPU, as the develop shader's input (an RGBA16F texture, oriented,
+    black 0, sensor saturation 1), until release(): from demosaic(), or upload(). With what
+    the CPU needs of it, averaged down and read back by demosaic()."""
+
+    width: int
+    height: int
+    cam: object  # the texture: for the GL thread only
+    look: np.ndarray | None = None  # demosaic(look=...)
+    base: np.ndarray | None = None  # demosaic(base=...)
+    removed: np.ndarray | None = None  # demosaic(nlm=...): what raw_nlm() returns as removed
+
+    def release(self):
+        if self.cam is not None:
+            _run(_release, self.cam)
+            self.cam = None
+
+
+def demosaic(mosaic, pattern, black: int, saturation: int, flip: int, cam_xyz, to_cam, nlm=None, look=None, base=None) -> Decoded:
+    """What LibRaw's postprocess() makes of a Bayer mosaic with develop.RAW_LINEAR, then as
+    camera RGB on the GPU: value * to_cam[0] - to_cam[1], in float32 like develop._decode.
+
+    mosaic: uint16, the sensor's visible area; pattern: its 2x2 colours as LibRaw numbers
+    them (3: the second green); black, saturation: LibRaw's user_black and user_sat (black
+    the same for every colour); flip: LibRaw's sizes.flip; cam_xyz: rawpy's rgb_xyz_matrix,
+    which AHD's CIELab needs. LibRaw's AHD is ported exactly: the result is the same to the bit.
+
+    nlm: raw_nlm()'s arguments after the mosaic, to denoise it first (Decoded.removed).
+    look: ((width, height), box): camera RGB averaged down over box (x0, y0, x1, y1) as PIL's
+        BOX resize does it, read back as Decoded.look (float32, height x width x 3).
+    base: (mul, weights, (width, height)): luminance min(rgb * mul, min(mul)) @ weights averaged
+        down the same way, as Decoded.base (float32, height x width)."""
+    mosaic = np.ascontiguousarray(mosaic, np.uint16)
+    xyz = _libraw_xyz_cam(tuple(np.asarray(cam_xyz, np.float32)[:3].ravel().tolist()))
+    to_cam = tuple(float(np.float32(v)) for v in to_cam)
+    if base is not None:
+        mul, weights, size = base
+        base = (tuple(np.float32(mul).tolist()), tuple(np.float32(weights).tolist()), size)
+    return _run(_demosaic, mosaic, np.asarray(pattern), int(black), int(saturation), int(flip), xyz, to_cam, nlm, look, base)
+
+
+def upload(rgb) -> Decoded:
+    """Camera RGB (HxWx3 float32) as a Decoded, for what LibRaw demosaics."""
+    h, w = rgb.shape[:2]
+    return Decoded(w, h, _run(_upload, _rgba16(rgb)))
+
+
 def render(rgb, coeffs, uniforms, tone, table, noise=None) -> np.ndarray:
     """camera RGB (HxWx3 float32) + base coefficients (hxwx2) + the look's tone curve (n) and
     colour table (depth x height x width x 3, see develop.look_textures) -> sRGB uint8 HxWx3.
-    With `noise` (denoise.Noise), colour noise is smoothed and grain given back first.
+    With `noise` (denoise.Noise), colour noise is smoothed and grain given back first."""
+    decoded = upload(rgb)
+    try:
+        return render_decoded(decoded, coeffs, uniforms, tone, table, noise)
+    finally:
+        decoded.release()
+
+
+def render_decoded(decoded: Decoded, coeffs, uniforms, tone, table, noise=None) -> np.ndarray:
+    """render() of camera RGB already on the GPU.
 
     Conversions happen here, on the caller's thread, so the GL thread only does GL work
     (it is shared by all exports)."""
     grain = None if noise is None else _f32(noise.grain)
-    out = _run(_render, _rgba16(rgb), _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain)
-    return np.ascontiguousarray(out[::-1, :, :3])  # GL reads the bottom row first
+    return _run(_render, decoded.cam, _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain)
 
 
-def denoised(rgb, noise) -> tuple[np.ndarray, np.ndarray]:
-    """What render() feeds the develop shader when given `noise`, read back: camera RGB with
-    colour noise smoothed (HxWx4 float16) and the grain to give back (HxW float16). The
-    editor's 100% view runs the shader on these in the browser, so it shows the export."""
-    h, w = rgb.shape[:2]
-    cam, grain = _run(_denoised, _rgba16(rgb), noise, _f32(noise.grain))
-    return np.frombuffer(cam, np.float16).reshape(h, w, 4), np.frombuffer(grain, np.float16).reshape(h, w)
+def read_decoded(decoded: Decoded, noise=None) -> tuple[np.ndarray, np.ndarray | None]:
+    """What render_decoded() feeds the develop shader, read back: camera RGB (HxWx4 float16),
+    with `noise` its colour noise smoothed, and the grain to give back (HxW float16) or None.
+    The editor's 100% view runs the shader on these in the browser, so it shows the export."""
+    h, w = decoded.height, decoded.width
+    grain = None if noise is None else _f32(noise.grain)
+    cam, grain = _run(_read_cam, decoded.cam, noise, grain)
+    return np.frombuffer(cam, np.float16).reshape(h, w, 4), None if grain is None else np.frombuffer(grain, np.float16).reshape(h, w)
 
 
 def _rgba16(rgb) -> np.ndarray:
@@ -71,6 +133,79 @@ def raw_nlm(mosaic: np.ndarray, black: float, A: float, B: float, weights, h: fl
     out, removed = _run(_raw_nlm, np.ascontiguousarray(mosaic, np.uint16), black, A, B, weights, h, search, patch, gain)
     hh, ww = mosaic.shape[0] // 2, mosaic.shape[1] // 2
     return np.frombuffer(out, np.uint16).reshape(mosaic.shape), np.frombuffer(removed, np.float32).reshape(hh, ww)
+
+
+# --- LibRaw's AHD: its constants, as LibRaw computes them -----------------------------------
+
+_XYZ_RGB = ((0.4124564, 0.3575761, 0.1804375), (0.2126729, 0.7151522, 0.0721750), (0.0193339, 0.1191920, 0.9503041))
+_D65 = tuple(float(np.float32(v)) for v in (0.95047, 1.0, 1.08883))
+
+
+@cache
+def _libraw_xyz_cam(cam_xyz: tuple) -> np.ndarray:
+    """AHD's camera RGB -> XYZ (3x3 float32), from rawpy's rgb_xyz_matrix (3x3, flattened):
+    LibRaw's cam_xyz_coeff (rgb_cam, in doubles) then cielab()'s set-up (in floats), every
+    step in LibRaw's order, so that its CIELab and the homogeneity decisions come out the same."""
+    cam_xyz = np.array(cam_xyz, np.float64).reshape(3, 3).tolist()
+    cam_rgb = [[_sum_seq(cam_xyz[i][k] * _XYZ_RGB[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    for row in cam_rgb:
+        num = _sum_seq(row)
+        row[:] = [v / num for v in row]
+    # LibRaw's pseudoinverse(cam_rgb)
+    work = [[1.0 if j == i + 3 else 0.0 for j in range(6)] for i in range(3)]
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                work[i][j] += cam_rgb[k][i] * cam_rgb[k][j]
+    for i in range(3):
+        num = work[i][i]
+        work[i] = [v / num for v in work[i]] if abs(num) > float(np.float32(1e-5)) else work[i]
+        for k in range(3):
+            if k != i:
+                num = work[k][i]
+                work[k] = [a - b * num for a, b in zip(work[k], work[i])]
+    inverse = [[_sum_seq(work[j][k + 3] * cam_rgb[i][k] for k in range(3)) for j in range(3)] for i in range(3)]
+    rgb_cam = np.float32([[inverse[j][i] for j in range(3)] for i in range(3)])
+    xyz_cam = np.zeros((3, 3), np.float32)
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                xyz_cam[i, j] = np.float32(xyz_cam[i, j] + np.float32(_XYZ_RGB[i][k] * float(rgb_cam[k, j]) / _D65[i]))
+    return xyz_cam
+
+
+def _sum_seq(values) -> float:
+    """A sum in the given order (like a C loop), unlike Python's sum() since 3.12 (Neumaier)."""
+    total = 0.0
+    for v in values:
+        total += v
+    return total
+
+
+@cache
+def _cbrt_table() -> np.ndarray:
+    """AHD's cube root table (LibRaw's cielab()), 65536 floats as a 256 x 256 texture."""
+    r = np.arange(0x10000, dtype=np.float32) / np.float32(65535)
+    cbrt = np.where(r > np.float32(0.008856), np.power(r, np.float32(1) / np.float32(3)), np.float32(7.787) * r + np.float32(16) / np.float32(116))
+    return cbrt.astype(np.float32).reshape(256, 256)
+
+
+@cache
+def _box_bounds(n: int, lo: float, hi: float, size: int) -> np.ndarray:
+    """What PIL's BOX resize averages along an axis, from n pixels over [lo, hi) down to size:
+    for each output pixel, its input pixels [first, end) (int32, size x 2). Pillow takes the
+    box as C floats, and weighs an input pixel 1 if its centre falls within the output
+    pixel's support, 0 otherwise (Resample.c: precompute_coeffs, box_filter)."""
+    lo32, hi32 = np.float32(lo), np.float32(hi)
+    scale = float(hi32 - lo32) / size
+    filterscale = max(scale, 1.0)
+    support, ss = 0.5 * filterscale, 1.0 / filterscale
+    out = np.empty((size, 2), np.int32)
+    for i in range(size):
+        center = float(lo32) + (i + 0.5) * scale
+        xs = [x for x in range(max(int(center - support + 0.5), 0), min(int(center + support + 0.5), n)) if -0.5 < (x - center + 0.5) * ss <= 0.5]
+        out[i] = xs[0], xs[-1] + 1
+    return out
 
 
 def info() -> dict:
@@ -271,6 +406,214 @@ SHADERS = {
         }""",
 }
 
+# LibRaw's AHD demosaicing (src/demosaic/ahd_demosaic.cpp), pass by pass; LibRaw works in tiles,
+# but every step only reads the mosaic's own values, so whole-image passes give the same.
+# Integer maths as LibRaw's (GLSL's >> on ints is arithmetic, as GCC's); float maths rounded
+# where LibRaw's is, see ROUND.
+AHD = """
+    uniform usampler2D mosaic;   // the scaled mosaic (ahd_scale), as on the sensor
+    uniform ivec4 pat;           // its colours (0 R, 1 G, 2 B) at (row & 1) * 2 + (col & 1)
+    int FC(ivec2 p) { return pat[(p.y & 1) * 2 + (p.x & 1)]; }
+    int M(ivec2 p) { return int(texelFetch(mosaic, p, 0).r); }
+"""
+AHD_RGB = AHD + """
+    uniform usampler2D green;    // green interpolated horizontally (r) and vertically (g)
+    int G(ivec2 p, int d) { uvec2 g = texelFetch(green, p, 0).rg; return int(d == 0 ? g.x : g.y); }
+    // ahd_interpolate_r_and_b_in_rgb: the pixel's colour with green interpolated along d
+    ivec3 rgbAt(ivec2 p, int d) {
+      int f = FC(p), x = M(p);
+      ivec3 rgb;
+      if (f == 1) {
+        int c = FC(p + ivec2(0, 1)), t1 = 2 - c;
+        int vh = x + ((M(p - ivec2(1, 0)) + M(p + ivec2(1, 0)) - G(p - ivec2(1, 0), d) - G(p + ivec2(1, 0), d)) >> 1);
+        int vv = x + ((M(p - ivec2(0, 1)) + M(p + ivec2(0, 1)) - G(p - ivec2(0, 1), d) - G(p + ivec2(0, 1), d)) >> 1);
+        rgb[t1] = clamp(vh, 0, 65535);
+        rgb[c] = clamp(vv, 0, 65535);
+        rgb[1] = x;
+      } else {
+        int c = 2 - f, g = G(p, d);
+        int s = M(p + ivec2(-1, -1)) + M(p + ivec2(1, -1)) + M(p + ivec2(-1, 1)) + M(p + ivec2(1, 1))
+              - G(p + ivec2(-1, -1), d) - G(p + ivec2(1, -1), d) - G(p + ivec2(-1, 1), d) - G(p + ivec2(1, 1), d) + 1;
+        rgb[c] = clamp(g + (s >> 2), 0, 65535);
+        rgb[f] = x;
+        rgb[1] = g;
+      }
+      return rgb;
+    }
+"""
+# LibRaw rounds every float product and sum on its own (x86-64: no fused multiply-add); the GPU's
+# compiler fuses a multiply and an add into one rounding, and `precise` doesn't stop it through
+# Mesa's D3D12 driver. A bit-level identity it can't see through (zero is a uniform, left at 0)
+# makes it round there.
+ROUND = """
+    uniform uint zero;
+    float r(float x) { return uintBitsToFloat(floatBitsToUint(x) ^ zero); }
+    vec3 r(vec3 x) { return uintBitsToFloat(floatBitsToUint(x) ^ zero); }
+"""
+# LibRaw's output (an RGBA16UI texture, oriented) as develop._decode turns it into camera RGB,
+# in float32 as numpy does it: a multiply, then a subtraction.
+TO_CAM = ROUND + """
+    uniform usampler2D rgb; uniform vec2 toCam;
+    vec3 camAt(ivec2 p) { return r(r(vec3(texelFetch(rgb, p, 0).rgb) * toCam.x) - toCam.y); }
+    uniform isampler2D bounds;  // _box_bounds() along x, one texel per output column
+"""
+
+SHADERS.update({
+    # LibRaw's black subtraction (raw2image_ex) and scaling to 16 bits (scale_colors)
+    "ahd_scale": """
+        uniform usampler2D raw; uniform int black; uniform float scale;
+        out uint v;
+        void main() {
+          int x = int(texelFetch(raw, ivec2(gl_FragCoord.xy), 0).r);
+          v = uint(clamp(int(float(x > black ? x - black : 0) * scale), 0, 65535));
+        }""",
+    # ahd_interpolate_green_h_and_v (green photosites keep their own)
+    "ahd_green": AHD + """
+        out uvec2 g;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          int x = M(p);
+          if (FC(p) == 1) { g = uvec2(x); return; }
+          int l = M(p - ivec2(1, 0)), r = M(p + ivec2(1, 0)), u = M(p - ivec2(0, 1)), d = M(p + ivec2(0, 1));
+          int vh = ((l + x + r) * 2 - M(p - ivec2(2, 0)) - M(p + ivec2(2, 0))) >> 2;
+          int vv = ((u + x + d) * 2 - M(p - ivec2(0, 2)) - M(p + ivec2(0, 2))) >> 2;
+          g = uvec2(clamp(vh, min(l, r), max(l, r)), clamp(vv, min(u, d), max(u, d)));
+        }""",
+    # ..._and_convert_to_cielab, both directions
+    "ahd_lab": AHD_RGB + ROUND + """
+        uniform vec3 xc0, xc1, xc2;   // columns of LibRaw's xyz_cam
+        uniform sampler2D cbrtTable;  // _cbrt_table()
+        float cbrtAt(float x) {
+          int i = clamp(int(x), 0, 65535);
+          return texelFetch(cbrtTable, ivec2(i & 255, i >> 8), 0).r;
+        }
+        ivec4 cielab(ivec3 rgb) {
+          vec3 xyz = vec3(0.5);
+          xyz = r(xyz + r(xc0 * float(rgb.r)));
+          xyz = r(xyz + r(xc1 * float(rgb.g)));
+          xyz = r(xyz + r(xc2 * float(rgb.b)));
+          float X = cbrtAt(xyz.x), Y = cbrtAt(xyz.y), Z = cbrtAt(xyz.z);
+          return ivec4(int(r(r(116.0 * Y) - 16.0) * 64.0), int(32000.0 * r(X - Y)), int(12800.0 * r(Y - Z)), 0);
+        }
+        layout(location = 0) out ivec4 labH; layout(location = 1) out ivec4 labV;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          labH = cielab(rgbAt(p, 0));
+          labV = cielab(rgbAt(p, 1));
+        }""",
+    # ahd_interpolate_build_homogeneity_map
+    "ahd_homo": """
+        uniform isampler2D labH; uniform isampler2D labV;
+        out uvec2 homo;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          ivec2 dir[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+          ivec3 ch = texelFetch(labH, p, 0).xyz, cv = texelFetch(labV, p, 0).xyz;
+          uint ldh[4], ldv[4], abh[4], abv[4];
+          for (int i = 0; i < 4; i++) {
+            ivec3 nh = texelFetch(labH, p + dir[i], 0).xyz, nv = texelFetch(labV, p + dir[i], 0).xyz;
+            ivec2 dh = ch.yz - nh.yz, dv = cv.yz - nv.yz;
+            ldh[i] = uint(abs(ch.x - nh.x));
+            ldv[i] = uint(abs(cv.x - nv.x));
+            abh[i] = uint(dh.x * dh.x + dh.y * dh.y);
+            abv[i] = uint(dv.x * dv.x + dv.y * dv.y);
+          }
+          uint leps = min(max(ldh[0], ldh[1]), max(ldv[2], ldv[3]));
+          uint abeps = min(max(abh[0], abh[1]), max(abv[2], abv[3]));
+          uint hh = 0u, hv = 0u;
+          for (int i = 0; i < 4; i++) {
+            hh += (ldh[i] <= leps && abh[i] <= abeps) ? 1u : 0u;
+            hv += (ldv[i] <= leps && abv[i] <= abeps) ? 1u : 0u;
+          }
+          homo = uvec2(hh, hv);
+        }""",
+    # ahd_interpolate_combine_homogeneous_pixels, and border_interpolate(5) for the 5-pixel
+    # border, at the output's size: LibRaw's flip_index turns it.
+    "ahd_combine": AHD_RGB + """
+        uniform usampler2D homo; uniform int flip;
+        out uvec4 rgbOut;
+        void main() {
+          ivec2 size = textureSize(mosaic, 0), o = ivec2(gl_FragCoord.xy);
+          int row = o.y, col = o.x;
+          if ((flip & 4) != 0) { int t = row; row = col; col = t; }
+          if ((flip & 2) != 0) row = size.y - 1 - row;
+          if ((flip & 1) != 0) col = size.x - 1 - col;
+          ivec2 p = ivec2(col, row);
+          ivec3 rgb;
+          if (all(greaterThanEqual(p, ivec2(5))) && all(lessThan(p, size - 5))) {
+            int hh = 0, hv = 0;
+            for (int j = -1; j <= 1; j++)
+              for (int i = -1; i <= 1; i++) {
+                uvec2 h = texelFetch(homo, p + ivec2(i, j), 0).rg;
+                hh += int(h.x);
+                hv += int(h.y);
+              }
+            ivec3 a = rgbAt(p, 0), b = rgbAt(p, 1);
+            rgb = hh != hv ? (hv > hh ? b : a) : (a + b) >> 1;
+          } else {
+            ivec3 sum = ivec3(0), n = ivec3(0);
+            for (int j = -1; j <= 1; j++)
+              for (int i = -1; i <= 1; i++) {
+                ivec2 q = p + ivec2(i, j);
+                if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) continue;
+                sum[FC(q)] += M(q);
+                n[FC(q)] += 1;
+              }
+            int f = FC(p);
+            for (int c = 0; c < 3; c++) rgb[c] = c == f ? M(p) : int(uint(sum[c]) / uint(max(n[c], 1)));
+          }
+          rgbOut = uvec4(uvec3(rgb), 0u);
+        }""",
+    # Into an RGBA16F texture, rounded to the nearest half float as numpy rounds (D3D12 writes
+    # float32 to float16 truncated): to the half float's step at that exponent, ties to even.
+    "rgb_cam": TO_CAM + """
+        out vec4 cam;
+        vec3 toHalf(vec3 x) {
+          ivec3 e = ivec3((floatBitsToUint(x) >> 23) & 255u) - 127;
+          vec3 step = exp2(vec3(max(e, -14) - 10));
+          return roundEven(x / step) * step;
+        }
+        void main() { cam = vec4(toHalf(camAt(ivec2(gl_FragCoord.xy))), 0.0); }""",
+    # PIL's BOX resize, along x then along y; averages in float32 (PIL: doubles).
+    "box_cam": TO_CAM + """
+        out vec4 v;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.x, 0), 0).xy;
+          vec3 s = vec3(0.0);
+          for (int x = b.x; x < b.y; x++) s += camAt(ivec2(x, p.y));
+          v = vec4(s / float(b.y - b.x), 0.0);
+        }""",
+    "box_luminance": TO_CAM + """
+        uniform vec3 mul; uniform vec3 weights;
+        out float v;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.x, 0), 0).xy;
+          float clipLevel = min(mul.r, min(mul.g, mul.b)), s = 0.0;
+          for (int x = b.x; x < b.y; x++) s += dot(min(camAt(ivec2(x, p.y)) * mul, vec3(clipLevel)), weights);
+          v = s / float(b.y - b.x);
+        }""",
+    "box_columns": """
+        uniform sampler2D src; uniform isampler2D bounds;  // along y, one texel per output row
+        out vec4 v;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy), b = texelFetch(bounds, ivec2(p.y, 0), 0).xy;
+          vec4 s = vec4(0.0);
+          for (int y = b.x; y < b.y; y++) s += texelFetch(src, ivec2(p.x, y), 0);
+          v = s / float(b.y - b.x);
+        }""",
+})
+
+
+# web/develop.vert upside down: GL reads a framebuffer bottom row first, so renders come back
+# top row first, ready to save.
+EXPORT_VERTEX = """#version 300 es
+in vec2 pos;
+out vec2 uv;
+void main() {
+  uv = pos * 0.5 + 0.5;
+  gl_Position = vec4(pos, 0.0, 1.0);
+}"""
+
 
 def _setup() -> dict:
     if not _gl:
@@ -280,10 +623,7 @@ def _setup() -> dict:
             ctx = moderngl.create_standalone_context(backend="egl")
         except Exception as e:
             raise RuntimeError(f"Exports need OpenGL through EGL (Mesa's libegl1): {e}") from e
-        prog = ctx.program(
-            vertex_shader=(WEB / "develop.vert").read_text(),
-            fragment_shader=(WEB / "develop.frag").read_text(),
-        )
+        prog = ctx.program(vertex_shader=EXPORT_VERTEX, fragment_shader=(WEB / "develop.frag").read_text())
         quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], "f4").tobytes())
         _gl.update(ctx=ctx, prog=prog, quad=quad, vao=ctx.vertex_array(prog, [(quad, "2f", "pos")]), passes={})
         _gl["finish"] = _gl_finish() or ctx.finish
@@ -362,12 +702,24 @@ def _box(src, tmp, out, r: int):
         fb.release()
 
 
-def _raw_nlm(mosaic, black, A, B, weights, h, search, patch, gain):
+def _raw_nlm(mosaic, *args):
+    size = (mosaic.shape[1], mosaic.shape[0])
+    raw = _texture(size, 1, mosaic, dtype="u2")
+    out, removed = _nlm(raw, size, *args)
+    try:
+        return _read(out), _read(removed)
+    finally:
+        _release(raw, out, removed)
+
+
+def _nlm(raw, size, black, A, B, weights, h, search, patch, gain):
+    """raw_nlm() of the mosaic in texture `raw`: the denoised mosaic (R16UI) and what was
+    removed (R32F, half size), as textures to hand back with _release."""
     import moderngl
 
     ctx = _setup()["ctx"]
-    size, half = (mosaic.shape[1], mosaic.shape[0]), (mosaic.shape[1] // 2, mosaic.shape[0] // 2)
-    raw, z, acc = _texture(size, 1, mosaic, dtype="u2"), _texture(half, 4), _texture(half, 4)
+    half = (size[0] // 2, size[1] // 2)
+    z, acc = _texture(half, 4), _texture(half, 4)
     d, dist = (_texture(half, 4, dtype="f2") for _ in range(2))  # half floats: 25% faster, differences < 0.01 noise sd
     wgt, out, removed = _texture(half, 1), _texture(size, 1, dtype="u2"), _texture(half, 1)
     fbs = {k: ctx.framebuffer(t) for k, t in [("z", [z]), ("acc", [acc, wgt]), ("d", [d]), ("dist", [dist]), ("out", [out]), ("removed", [removed])]}
@@ -390,10 +742,91 @@ def _raw_nlm(mosaic, black, A, B, weights, h, search, patch, gain):
         ctx.disable(moderngl.BLEND)
         _pass("raw_out", fbs["out"], {"raw": raw, "sum": acc, "weight": wgt}, gain=float(gain), **common)
         _pass("raw_removed", fbs["removed"], {"raw": raw, "sum": acc, "weight": wgt}, weights=tuple(weights), **common)
-        return _read(out), _read(removed)
+        return out, removed
+    except BaseException:
+        _release(out, removed)
+        raise
     finally:
         ctx.disable(moderngl.BLEND)
-        _release(raw, z, acc, d, dist, wgt, out, removed, *fbs.values())
+        _release(z, acc, d, dist, wgt, *fbs.values())
+
+
+def _check_size(w: int, h: int):
+    limit = _setup()["ctx"].info["GL_MAX_TEXTURE_SIZE"]
+    if max(w, h) > limit:
+        raise ValueError(f"{w}x{h} is larger than this GPU's textures ({limit})")
+
+
+def _upload(cam) -> object:
+    h, w = cam.shape[:2]
+    _check_size(w, h)
+    return _texture((w, h), 4, cam, dtype="f2")
+
+
+def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, base) -> Decoded:
+    ctx = _setup()["ctx"]
+    h, w = mosaic.shape
+    size, out = (w, h), ((h, w) if flip & 4 else (w, h))
+    _check_size(w, h)
+    owned = []
+
+    def tex(*args, **kwargs):
+        owned.append(_texture(*args, **kwargs))
+        return owned[-1]
+
+    def fb(*texs):
+        owned.append(ctx.framebuffer(list(texs)))
+        return owned[-1]
+
+    cam = None
+    try:
+        raw, removed = tex(size, 1, mosaic, dtype="u2"), None
+        if nlm is not None:
+            raw, removed_tex = _nlm(raw, size, *nlm)
+            owned += [raw, removed_tex]
+            removed = np.frombuffer(_read(removed_tex), np.float32).reshape(h // 2, w // 2)
+        pat = tuple(1 if c == 3 else int(c) for c in pattern.ravel())  # the second green is green
+        scaled, green, homo = tex(size, 1, dtype="u2"), tex(size, 2, dtype="u2"), tex(size, 2, dtype="u1")
+        lab_h, lab_v, rgb = tex(size, 4, dtype="i2"), tex(size, 4, dtype="i2"), tex(out, 4, dtype="u2")
+        cbrt = tex((256, 256), 1, _cbrt_table())
+        _pass("ahd_scale", fb(scaled), {"raw": raw}, black=black, scale=float(np.float32(65535) / np.float32(saturation)))
+        _pass("ahd_green", fb(green), {"mosaic": scaled}, pat=pat)
+        lab = {"mosaic": scaled, "green": green, "cbrtTable": cbrt}
+        _pass("ahd_lab", fb(lab_h, lab_v), lab, pat=pat, xc0=xyz[:, 0], xc1=xyz[:, 1], xc2=xyz[:, 2])
+        _pass("ahd_homo", fb(homo), {"labH": lab_h, "labV": lab_v})
+        _pass("ahd_combine", fb(rgb), {"mosaic": scaled, "green": green, "homo": homo}, pat=pat, flip=flip)
+        cam = _texture(out, 4, dtype="f2")
+        _pass("rgb_cam", fb(cam), {"rgb": rgb}, toCam=to_cam)
+        decoded = Decoded(out[0], out[1], cam, removed=removed)
+        if look is not None:
+            look_size, box = look
+            decoded.look = _resize(rgb, out, look_size, box, "box_cam", 3, toCam=to_cam)
+        if base is not None:
+            mul, weights, base_size = base
+            decoded.base = _resize(rgb, out, base_size, (0, 0, *out), "box_luminance", 1, toCam=to_cam, mul=mul, weights=weights)[..., 0]
+        return decoded
+    except BaseException:
+        if cam is not None:
+            _release(cam)
+        raise
+    finally:
+        _release(*owned)
+
+
+def _resize(rgb, in_size, size, box, shader: str, components: int, **uniforms) -> np.ndarray:
+    """PIL's BOX resize of what `shader` makes of LibRaw's output in texture `rgb` (in_size),
+    over `box`, down to `size`: float32, height x width x components."""
+    ctx = _setup()["ctx"]
+    (w, h), (ow, oh), (x0, y0, x1, y1) = in_size, size, box
+    bx, by = _texture((ow, 1), 2, _box_bounds(w, x0, x1, ow), dtype="i4"), _texture((oh, 1), 2, _box_bounds(h, y0, y1, oh), dtype="i4")
+    rows, small = _texture((ow, h), 4 if components > 1 else 1), _texture((ow, oh), 4 if components > 1 else 1)
+    fbs = [ctx.framebuffer([rows]), ctx.framebuffer([small])]
+    try:
+        _pass(shader, fbs[0], {"rgb": rgb, "bounds": bx}, **uniforms)
+        _pass("box_columns", fbs[1], {"src": rows, "bounds": by})
+        return np.frombuffer(_read(fbs[1], components=components, dtype="f4"), np.float32).reshape(oh, ow, components)
+    finally:
+        _release(bx, by, rows, small, *fbs)
 
 
 def _chroma_nr(cam, size, mul, rgb_cam):
@@ -450,28 +883,24 @@ def _with_noise(cam, noise, removed, size) -> tuple:
     return smoothed, _grain(removed, noise.weights, size)
 
 
-def _denoised(cam, noise, removed) -> tuple[bytes, bytes]:
-    h, w = cam.shape[:2]
-    src = _texture((w, h), 4, cam, dtype="f2")
-    smoothed, grain = _with_noise(src, noise, removed, (w, h))
+def _read_cam(cam, noise, removed) -> tuple[bytes, bytes | None]:
+    if noise is None:
+        return _read(cam), None
+    smoothed, grain = _with_noise(cam, noise, removed, cam.size)
     try:
         return _read(smoothed), _read(grain)
     finally:
-        _release(src, smoothed, grain)
+        _release(smoothed, grain)
 
 
 def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
-    """RGBA8, bottom row first."""
+    """sRGB, HxWx3 uint8 (top row first: EXPORT_VERTEX), from the camera RGB texture `cam`."""
     import moderngl
 
     gl = _setup()
     ctx, prog = gl["ctx"], gl["prog"]
-    h, w = cam.shape[:2]
-    if max(h, w) > ctx.info["GL_MAX_TEXTURE_SIZE"]:
-        raise ValueError(f"{w}x{h} is larger than this GPU's textures ({ctx.info['GL_MAX_TEXTURE_SIZE']})")
+    w, h = cam.size
     owned = []
-    cam = _texture((w, h), 4, cam, dtype="f2")
-    owned.append(cam)
     if noise is not None:
         cam, grain = _with_noise(cam, noise, removed, (w, h))
         owned.append(cam)
@@ -495,6 +924,6 @@ def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
                 prog[name].value = tuple(value) if isinstance(value, (list, tuple, np.ndarray)) else value
         fbo.use()
         gl["vao"].render(moderngl.TRIANGLE_STRIP)
-        return np.frombuffer(_read(fbo, components=4), np.uint8).reshape(h, w, 4)
+        return np.frombuffer(_read(fbo, components=3, alignment=1), np.uint8).reshape(h, w, 3)
     finally:
         _release(*owned)

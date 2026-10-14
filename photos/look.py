@@ -184,11 +184,35 @@ def scene_rgb(rgb: np.ndarray, color) -> np.ndarray:
     return np.minimum(rgb * mul, mul.min()) @ color.rgb_cam.T.astype(np.float32)
 
 
+@dataclass
+class Target:
+    """The camera's JPEG at a quarter of its size, and the area of camera RGB it shows: the box
+    (x0, y0, x1, y1, camera RGB pixels) to average down to `size` (BOX) to line up with it."""
+
+    jpeg: np.ndarray  # 8-bit RGB, size[1] x size[0]
+    size: tuple[int, int]
+    box: tuple[float, float, float, float]
+
+
 def samples(rgb: np.ndarray, color, jpeg: bytes, max_blocks: int = 20000, max_pixels: int = 30000, seed: int = 0) -> Samples | None:
     """rgb: camera RGB at any size (half from the preview's decode, full from an export's),
     oriented; jpeg: the camera's JPEG with its orientation tag. The work happens at a quarter
     of the JPEG's size, where a 4 x 4 block covers 16 x 16 full-size pixels."""
     h, w = rgb.shape[:2]
+    t = jpeg_target((w, h), jpeg)
+    if t is None:
+        return None
+    raw = np.stack(
+        [np.asarray(Image.fromarray(np.ascontiguousarray(rgb[..., c])).resize(t.size, Image.Resampling.BOX, box=t.box)) for c in range(3)],
+        -1,
+    )
+    return samples_at(raw, t, color, max_blocks, max_pixels, seed)
+
+
+def jpeg_target(size: tuple[int, int], jpeg: bytes) -> Target | None:
+    """Where the camera's JPEG lies in camera RGB of `size` (width, height), oriented; None if
+    it doesn't fit in it."""
+    w, h = size
     im = Image.open(io.BytesIO(jpeg))
     full_w, full_h = im.size
     im.draft("RGB", (full_w // WORK_SCALE, full_h // WORK_SCALE))  # cheap: the decoder scales the DCT
@@ -204,12 +228,13 @@ def samples(rgb: np.ndarray, color, jpeg: bytes, max_blocks: int = 20000, max_pi
     x0, y0 = (w - fw) / 2, (h - fh) / 2
     if x0 < -0.5 or y0 < -0.5:
         return None
-    field = (x0, y0, x0 + fw, y0 + fh)
-    raw = np.stack(
-        [np.asarray(Image.fromarray(np.ascontiguousarray(rgb[..., c])).resize((qw, qh), Image.Resampling.BOX, box=field)) for c in range(3)],
-        -1,
-    )
-    cam8 = np.asarray(im)
+    return Target(np.asarray(im), (qw, qh), (x0, y0, x0 + fw, y0 + fh))
+
+
+def samples_at(raw: np.ndarray, t: Target, color, max_blocks: int = 20000, max_pixels: int = 30000, seed: int = 0) -> Samples:
+    """samples() from camera RGB already averaged down onto the target (raw, t.size)."""
+    qw, qh = t.size
+    cam8 = t.jpeg
     cam = _SRGB_TO_LINEAR[cam8]
     scene = scene_rgb(raw, color)
 
@@ -291,11 +316,12 @@ class Look:
     @classmethod
     def for_photo(cls, rgb: np.ndarray, color, jpeg: bytes | None, camera: str | None, iso: float | None) -> Look:
         """rgb: the photo's camera RGB, at any size."""
+        return cls.from_samples(samples(rgb, color, jpeg) if jpeg else None, camera, iso)
+
+    @classmethod
+    def from_samples(cls, s: Samples | None, camera: str | None, iso: float | None) -> Look:
         profile = load_profile(camera)
-        tone = None
-        if jpeg:
-            s = samples(rgb, color, jpeg)
-            tone = fit_tone(s) if s is not None else None
+        tone = fit_tone(s) if s is not None else None
         if tone is None:
             tone = fallback_tone()
         anchor = float(np.log2(tone_inverse(tone, 0.18)))

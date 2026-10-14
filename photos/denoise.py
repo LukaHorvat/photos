@@ -109,6 +109,14 @@ def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float]
     scale: raw units -> our normalised camera RGB (1 / (saturation - black))."""
     from . import gpu
 
+    args = nlm_args(raw, black, scale, color, typical)
+    denoised, removed = gpu.raw_nlm(raw.raw_image_visible, *args)
+    raw.raw_image_visible[...] = denoised
+    return removed, args[-1]
+
+
+def nlm_args(raw, black: float, scale: float, color, typical: tuple[float, float] | None = None) -> tuple:
+    """raw_nlm()'s arguments for gpu.raw_nlm() after the mosaic (the gain last)."""
     mosaic = raw.raw_image_visible
     pattern = np.asarray(raw.raw_pattern)
     colours = [{0: 0, 1: 1, 2: 2, 3: 1}[int(pattern[p])] for p in PHASES]  # LibRaw calls the second green 3
@@ -118,9 +126,7 @@ def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float]
     model = noise_model(mosaic, black, pattern)
     if typical:
         model = trusted(model, typical, CEILING_LEVEL * (raw.white_level - black))
-    denoised, removed = gpu.raw_nlm(mosaic, black, *model, weights, STRENGTH, SEARCH, PATCH, gain)
-    mosaic[...] = denoised
-    return removed, gain
+    return (black, *model, weights, STRENGTH, SEARCH, PATCH, gain)
 
 
 def orient(img: np.ndarray, flip: int) -> np.ndarray:
