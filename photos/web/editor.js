@@ -100,7 +100,7 @@ function formatValue(key, v) {
     const t = v ?? asShotTemp();
     return v == null ? (t ? `${t} K, as shot` : 'as shot') : `${v} K`;
   }
-  if (key === 'noise') {
+  if (NR_KEYS.includes(key)) {
     if (v != null) return v ? `${v}%` : 'Off';
     const name = editCurrent();
     const iso = name && metas.get(name)?.iso;
@@ -109,16 +109,20 @@ function formatValue(key, v) {
   return String(v);
 }
 
-// Noise reduction: null automatic (the server decides by ISO), else its strength in % of
-// the camera's, 0 off. It changes the data the server sends, so it applies on release.
-const finalKey = (name, setting) => `${name}|${setting ?? 'auto'}`;
-const currentKey = () => editCurrent() && finalKey(editCurrent(), ED.live?.noise);
+// Noise reduction, luminance (noise) and colour (chroma): each null automatic (the server
+// decides by ISO), else its strength in % of the camera's, 0 off. They change the data the
+// server sends, so they apply on release. The server takes the two as one: 'auto,60'.
+const NR_KEYS = ['noise', 'chroma'];
+const nrOf = (settings) => NR_KEYS.map((k) => settings?.[k] ?? 'auto').join(',');
+const finalKey = (name, nr) => `${name}|${nr}`;
+const currentKey = () => editCurrent() && finalKey(editCurrent(), nrOf(ED.live));
+const reducing = (name, settings) => NR_KEYS.some((k) => nrExpected(name, settings?.[k]));
 
 function nrExpected(name, setting) {
-  // Whether noise reduction will be on; for automatic, the server's decision once a final
-  // preview tells it (its grain), else the same rule from the ISO.
+  // Whether this noise reduction will be on; for automatic, the server's decision once a
+  // final preview tells it (its grain), else the same rule from the ISO.
   if (setting != null) return setting > 0;
-  const shown = ED.finals.get(finalKey(name, null))?.info;
+  const shown = ED.finals.get(finalKey(name, 'auto,auto'))?.info;
   if (shown) return shown.grain;
   const iso = metas.get(name)?.iso;
   return !!iso && iso >= ED.autoNoiseIso;
@@ -127,7 +131,7 @@ function nrExpected(name, setting) {
 function setSettings(settings) {
   // A change made at once (not dragged): saved, and if noise reduction changed, the
   // final data for it fetched.
-  const noiseChanged = (settings.noise ?? null) !== (ED.live.noise ?? null);
+  const noiseChanged = nrOf(settings) !== nrOf(ED.live);
   ED.live = settings;
   ED.before = false;
   updateSliders();
@@ -147,7 +151,7 @@ function updateSliders() {
     if (key === 'temp') {
       const t = v ?? asShotTemp();
       input.value = t ? tempToSlider(t) : 500;
-    } else if (key === 'noise') {
+    } else if (NR_KEYS.includes(key)) {
       input.value = v ?? (nrExpected(editCurrent(), null) ? 100 : 0);
     } else {
       input.value = v;
@@ -164,7 +168,7 @@ for (const el of SLIDERS) {
   input.addEventListener('input', () => {
     if (!ED.live) return;
     const v = Number(input.value);
-    if (key === 'noise') { // only the label until release
+    if (NR_KEYS.includes(key)) { // only the label until release
       const label = el.querySelector('.sval');
       label.textContent = formatValue(key, v);
       label.classList.remove('default');
@@ -176,8 +180,8 @@ for (const el of SLIDERS) {
     requestDraw();
   });
   input.addEventListener('change', () => {
-    if (key !== 'noise') commit();
-    else if (ED.live) setSettings({ ...ED.live, noise: Number(input.value) });
+    if (!NR_KEYS.includes(key)) commit();
+    else if (ED.live) setSettings({ ...ED.live, [key]: Number(input.value) });
   });
   // Hand the arrow keys back to photo navigation once the mouse lets go.
   input.addEventListener('pointerup', () => setTimeout(() => input.blur(), 0));
@@ -242,12 +246,12 @@ function previewSide() {
 // Each photo comes in two steps: a quick preview without noise reduction (~0.5 s), then
 // the export's own input shrunk, noise reduction included if it's on (develop.full_preview;
 // ~3 s, unless the server prepared it while you were on the photo before).
-function preview(name, final = false, setting = null) {
-  const [cache, key] = final ? [ED.finals, finalKey(name, setting)] : [ED.previews, name];
+function preview(name, final = false, nr = 'auto,auto') {
+  const [cache, key] = final ? [ED.finals, finalKey(name, nr)] : [ED.previews, name];
   let p = cache.get(key);
   if (!p) {
     const abort = new AbortController();
-    const extra = final ? `&final=1&noise=${setting ?? 'auto'}` : '';
+    const extra = final ? `&final=1&noise=${nr}` : '';
     const promise = fetch(`/develop/${enc(name)}?w=${previewSide()}${extra}&v=${S.version}`, { signal: abort.signal })
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.statusText))))
       .then(parsePreview);
@@ -274,14 +278,14 @@ function requestDraw() {
   }
   const loading = ED.view && visibleTiles().some((t) => !t.loaded);
   // Waiting for final data: with noise reduction, or after its setting changed (to off).
-  const reducing = nrExpected(editCurrent(), ED.live?.noise);
-  const finishing = ED.shownKey !== currentKey() && (reducing || ED.shownKey !== `${editCurrent()}|quick`);
+  const nr = reducing(editCurrent(), ED.live);
+  const finishing = ED.shownKey !== currentKey() && (nr || ED.shownKey !== `${editCurrent()}|quick`);
   $('#editnote').textContent = ED.picking
     ? PICK_HINT[ED.picking]
     : ED.before ? 'Before'
     : ED.shown !== editCurrent() ? 'Developing…'
     : loading ? 'Loading full size…'
-    : finishing ? (reducing ? 'Reducing noise…' : 'Developing…') : '';
+    : finishing ? (nr ? 'Reducing noise…' : 'Developing…') : '';
 }
 
 function layoutEdit() {
@@ -369,7 +373,7 @@ function wantTiles() {
   const name = editCurrent();
   if (ED.full.key !== currentKey()) {
     for (const abort of ED.full.pending.values()) abort.abort();
-    ED.full = { key: currentKey(), name, noise: ED.live?.noise ?? 'auto', loaded: new Map(), pending: new Map(), queue: [] };
+    ED.full = { key: currentKey(), name, noise: nrOf(ED.live), loaded: new Map(), pending: new Map(), queue: [] };
     ED.dev.allocFull(ED.dev.info.fullWidth, ED.dev.info.fullHeight);
   }
   ED.full.queue = visibleTiles(1).filter((t) => !t.loaded && !ED.full.pending.has(t.key));
@@ -616,15 +620,15 @@ function loadEdit(name) {
   const near = [0, 1, 2, -1].map((d) => ED.kept[ED.pos + d]).filter(Boolean);
   // The server prepares final data for this photo and the next only, so their noise
   // settings go along (this photo's may not be saved yet).
-  const setting = ED.live?.noise ?? null;
+  const nr = nrOf(ED.live);
   const next = near[1];
-  const nextSetting = next ? settingsOf(S.order.get(next)).noise : null;
+  const nextNr = nrOf(next ? settingsOf(S.order.get(next)) : null);
   fetch('/api/develop-hint', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ names: near, w: previewSide(), noise: [setting ?? 'auto', nextSetting ?? 'auto'] }),
+    body: JSON.stringify({ names: near, w: previewSide(), noise: [nr, nextNr] }),
   }).catch(() => {});
-  const keepFinal = [finalKey(name, setting), next && finalKey(next, nextSetting)];
+  const keepFinal = [finalKey(name, nr), next && finalKey(next, nextNr)];
   for (const [cache, keep] of [[ED.previews, near], [ED.finals, keepFinal]]) {
     for (const [k, p] of cache) {
       if (!keep.includes(k)) {
@@ -646,17 +650,17 @@ function loadEdit(name) {
   const failed = (err) => {
     if (err.name !== 'AbortError' && editCurrent() === name) toast(`Couldn't develop ${name}: ${err.message}`, true);
   };
-  const key = finalKey(name, setting);
+  const key = finalKey(name, nr);
   const ready = ED.finals.get(key)?.info;
   if (ready) {
     if (ED.shownKey !== key) show(ready, key);
   } else if (ED.shown !== name) {
     preview(name).then((info) => { if (ED.shown !== name) show(info, `${name}|quick`); }).catch(failed);
   }
-  preview(name, true, setting)
+  preview(name, true, nr)
     .then((info) => {
       if (ED.shownKey !== key && currentKey() === key) show(info, key);
-      if (editCurrent() === name && next) preview(next, true, nextSetting).catch(() => {});
+      if (editCurrent() === name && next) preview(next, true, nextNr).catch(() => {});
     })
     .catch(failed);
 }

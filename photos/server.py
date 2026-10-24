@@ -124,7 +124,7 @@ class Library:
         self.previews = Prefetcher(
             lambda key: develop.preview(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
-        # The export's input at full size, by (name, noise reduction strength), for the editor's final
+        # The export's input at full size, by (name, noise reduction strengths), for the editor's final
         # views: ~200 MB and 0.6-2 s of work each, for the photo on screen and the next (which
         # waits for it). Two at a time, so a change to the photo on screen needn't wait for the next.
         self.fulls = Prefetcher(
@@ -147,6 +147,7 @@ class Library:
         state.setdefault("version", 1)
         state.setdefault("marks", {})
         state.setdefault("edits", {})
+        state["edits"] = {name: develop.clean(s) for name, s in state["edits"].items()}  # settings added since
         return state
 
     def _save(self):
@@ -229,13 +230,13 @@ class Library:
         return dict(zip(self.names, edits.resolve(self.names, self.groups(), self.state["edits"])))
 
     def full_key(self, name: str, noise: str | None = None):
-        """fulls key for a photo: its noise setting as the editor has it ("auto" or a number),
-        or as saved."""
-        if noise is None:
-            setting = self.settings()[name]["noise"]
-        else:
-            setting = None if noise == "auto" else float(noise)
-        return name, denoise.strength(setting, self.photos[name].iso)
+        """fulls key for a photo: its noise reduction settings as the editor has them (luminance,
+        colour: "auto,60"), or as saved."""
+        settings = self.settings()[name]
+        if noise is not None:
+            lum, col = (None if v == "auto" else float(v) for v in noise.split(","))
+            settings = {**settings, "noise": lum, "chroma": col}
+        return name, develop.strengths(settings, self.photos[name].iso)
 
     def runs(self) -> dict:
         """What the editor shows: which photos share settings, and those settings."""

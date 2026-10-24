@@ -78,8 +78,12 @@
           <span class="sname">Saturation</span><span class="sval"></span>
           <input type="range" min="-100" max="100" step="1">
         </label>
-        <label class="slider" data-key="noise" title="Auto: the camera's strength (100%) from ISO 1000, off below, like its own JPEGs. Applies when you let go; double-click for Auto.">
-          <span class="sname">Noise reduction</span><span class="sval"></span>
+        <label class="slider" data-key="noise" title="Smooths grain. Auto: the camera's strength (100%) from ISO 1000, off below, like its own JPEGs. Applies when you let go; double-click for Auto.">
+          <span class="sname">Luminance noise reduction</span><span class="sval"></span>
+          <input type="range" min="0" max="200" step="5">
+        </label>
+        <label class="slider" data-key="chroma" title="Smooths colour speckles. Auto: the camera's strength (100%) from ISO 1000, off below, like its own JPEGs. Applies when you let go; double-click for Auto.">
+          <span class="sname">Colour noise reduction</span><span class="sval"></span>
           <input type="range" min="0" max="200" step="5">
         </label>
       </div>

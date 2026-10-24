@@ -11,9 +11,11 @@
 3. Part of the removed luminance noise is given back, separately per scale, so the result
    has the camera's fine grain instead of looking plastic (in the develop shader).
 
-Weaker than standard (strength()), the standard result is mixed with the photo demosaiced
-without noise reduction: a weaker filter, or noise left in the mosaic, comes out of AHD with
-dark worms at high ISO, and giving more grain back can't bring back colour noise.
+Luminance and colour noise reduction have strengths of their own (strength()), as in
+Lightroom. Weaker than standard, the standard result is mixed with the photo demosaiced
+without noise reduction, its luminance and its colour separately: a weaker filter, or noise
+left in the mosaic, comes out of AHD with dark worms at high ISO, and giving more grain back
+can't bring back colour noise.
 """
 
 from __future__ import annotations
@@ -49,7 +51,13 @@ class Noise:
     rgb_cam: np.ndarray
     weights: tuple  # how much of the grain is given back per scale (grain_weights())
     chroma_eps: float = CHROMA_EPS  # colour smoothing (chroma_eps())
-    amount: float = 1.0  # how much of the result is noise reduced, the rest the photo without (gpu.Decoded.original)
+    amount: tuple = (1.0, 1.0)  # luminance, colour: how much is noise reduced, the rest the photo without (gpu.Decoded.original)
+
+    @classmethod
+    def at(cls, grain: np.ndarray, color, iso: int | None, strength: tuple[float, float]) -> Noise:
+        """For (luminance, colour) strengths (strength()); color: develop.Color."""
+        lum, col = strength
+        return cls(grain, color.as_shot, color.rgb_cam, grain_weights(iso, lum), chroma_eps(col), (amount(lum), amount(col)))
 
 
 def grain_weights(iso: int | None, s: float = 1.0) -> tuple:
@@ -93,8 +101,8 @@ def trusted(measured: tuple[float, float], typical: tuple[float, float], level: 
 
 
 def strength(setting: float | None, iso: int | None) -> float:
-    """How strong a photo's noise reduction is, 1 standard, 0 none: its setting in percent, or
-    automatically, standard from AUTO_ISO up."""
+    """How strong a photo's luminance or colour noise reduction is, 1 standard, 0 none: its
+    setting in percent, or automatically, standard from AUTO_ISO up."""
     if setting is None:
         return 1.0 if iso and iso >= AUTO_ISO else 0.0
     return min(max(setting / 100, 0.0), 2.0)
@@ -110,6 +118,11 @@ def amount(s: float) -> float:
     noise reduction. Below 1 the noise left falls as (1 - s)^2: each step looks about as big
     (noise halved looks far from half gone; mixed linearly, little changed below ~60%)."""
     return 1 - (1 - min(s, 1.0)) ** 2
+
+
+def mixed(strength: tuple[float, float]) -> bool:
+    """Whether (luminance, colour) strengths mix in the photo without noise reduction."""
+    return min(amount(s) for s in strength) < 1
 
 
 def supported(raw) -> bool:
@@ -131,8 +144,8 @@ def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float]
     typical noise at this ISO is known (`typical`, look.Profile.noise_at) and the photo
     measures more than CEILING times that, the typical noise is used instead.
 
-    Strength `s` (strength()): above 1, stronger averaging. Below 1 it's the same, and the
-    result gets mixed with the photo without noise reduction (amount()).
+    Strength `s` (strength(), of luminance noise reduction): above 1, stronger averaging.
+    Below 1 it's the same, and the result gets mixed with the photo without (amount()).
 
     scale: raw units -> our normalised camera RGB (1 / (saturation - black))."""
     from . import gpu

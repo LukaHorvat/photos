@@ -45,11 +45,13 @@ Noise reduction works like the camera's (`denoise.py`): non-local means on the
 raw data before demosaicing; colour noise smoothed along brightness edges; then
 part of the removed grain given back, more at lower ISO, as the camera keeps it.
 It runs on the GPU, about 0.3 s per photo in a batch. Like the camera's, it's on
-from ISO 1000 (Auto); the editor's Noise reduction slider overrides that per photo (and,
-like the other sliders, for the rest of its series): 100% is the camera's, less mixes in
-the photo without noise reduction (the noise left falls as (1 - s)², which looks even
-across the slider), more smooths further (200%: no grain at all), 0 turns it off.
-It applies when you let go of the slider, as it needs the server to redo the photo.
+from ISO 1000 (Auto); the editor's two sliders, as in Lightroom, override that per photo
+(and, like the other sliders, for the rest of its series): Luminance for the grain,
+Colour for colour speckles. 100% is the camera's; less mixes in that part of the photo
+without noise reduction (the noise left falls as (1 - s)², which looks even across the
+slider); more smooths further (luminance at 200%: no grain at all); 0 turns it off.
+Luminance 0 with colour 100% keeps all the grain but no colour noise.
+They apply when you let go of the slider, as they need the server to redo the photo.
 
 It needs to know how noisy the photo is. That's measured in the photo itself, but
 a photo full of fine texture (foliage) would read as very noisy and be smeared, so
@@ -81,13 +83,15 @@ Everything is saved as you go to `<folder>/.photos.json`:
 ```json
 {
   "marks": {"DSC_9282.NEF": "keep", "DSC_9283.NEF": "reject"},
-  "edits": {"DSC_9290.NEF": {"compress": 40, "exposure": 0.3, "temp": null, "saturation": 10, "contrast": 0, "noise": null}},
+  "edits": {"DSC_9290.NEF": {"compress": 40, "exposure": 0.3, "temp": null, "saturation": 10, "contrast": 0, "noise": null, "chroma": null}},
   "version": 1
 }
 ```
 
-An edit sits on the photo where it starts to apply (`temp: null` means as shot,
-`noise: null` automatic, else its strength in percent: 0 off, 100 the camera's).
+An edit sits on the photo where it starts to apply (`temp: null` means as shot;
+`noise` and `chroma`, luminance and colour noise reduction: `null` automatic, else the
+strength in percent, 0 off, 100 the camera's; an edit saved before `chroma` existed
+uses its `noise` for both).
 
 ## Tests
 

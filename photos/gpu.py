@@ -411,10 +411,11 @@ SHADERS = {
           t1 = vec4(I * ch, 0.0, 0.0);
         }""",
     # Full size again: the pixel's own luminance, the smoothed chroma (bilinear), back to camera
-    # RGB. Mixed with the photo without noise reduction, for a weaker one.
+    # RGB. For weaker noise reduction, mixed with the photo without: its luminance (camera RGB
+    # . lum) by amount.x, the colour around it (camera RGB - luminance * grey) by amount.y.
     "chroma_final": """
         uniform sampler2D cam; uniform sampler2D chroma; uniform vec3 mul; uniform float clipLevel; uniform mat3 rgbCam;
-        uniform mat3 camRgb; uniform sampler2D original; uniform float amount;
+        uniform mat3 camRgb; uniform sampler2D original; uniform vec2 amount; uniform vec3 lum; uniform vec3 grey;
         out vec4 result;
         void main() {
           ivec2 p = ivec2(gl_FragCoord.xy);
@@ -424,7 +425,12 @@ SHADERS = {
           float g = dot(s, vec3(0.25, 0.5, 0.25)) - 0.25 * (ch.x + ch.y);
           vec3 s2 = vec3(g + ch.x, g, g + ch.y);
           vec3 nr = (camRgb * (sign(s2) * s2 * s2)) / mul;
-          result = vec4(amount < 1.0 ? mix(texelFetch(original, p, 0).rgb, nr, amount) : nr, 1.0);
+          if (amount != vec2(1.0)) {
+            vec3 o = texelFetch(original, p, 0).rgb;
+            float dy = dot(nr - o, lum);
+            nr = o + amount.x * dy * grey + amount.y * (nr - o - dy * grey);
+          }
+          result = vec4(nr, 1.0);
         }""",
     # Grain: the removed luminance (half size) at full size, blurred at three scales (box
     # radius 1, 2 and 4 twice over, i.e. tent filters) and given back per scale. Rows, then columns.
@@ -994,12 +1000,14 @@ def _resize(shader: str, source: dict, in_size, size, box, components: int, **un
         _release(bx, by, small, fb)
 
 
-def _chroma_nr(cam, size, mul, rgb_cam, eps, original=None, amount=1.0):
+def _chroma_nr(cam, size, mul, rgb_cam, eps, original=None, amount=(1.0, 1.0)):
     """Camera RGB with colour noise smoothed (RGBA16F texture); eps: denoise.chroma_eps(). Mixed
-    with `original` (camera RGB without noise reduction), `amount` of it smoothed."""
+    with `original` (camera RGB without noise reduction): `amount` (luminance, colour) of it
+    noise reduced."""
     import moderngl
 
     from . import denoise
+    from .look import LUMA
 
     ctx = _setup()["ctx"]
     w, h = size
@@ -1023,8 +1031,10 @@ def _chroma_nr(cam, size, mul, rgb_cam, eps, original=None, amount=1.0):
             _pass("chroma_apply", fb(t0, t1), {"t0in": t0, "mc": mc})
         t0.filter = (moderngl.LINEAR, moderngl.LINEAR)
         out = _texture(size, 4, dtype="f2")
-        original, amount = (cam, 1.0) if original is None else (original, amount)
-        _pass("chroma_final", fb(out), {"cam": cam, "chroma": t0, "original": original}, amount=amount, camRgb=np.linalg.inv(rgb_cam).T, **common)
+        original, amount = (cam, (1.0, 1.0)) if original is None else (original, amount)
+        cam_rgb = np.linalg.inv(rgb_cam)
+        lum, grey = mul * (rgb_cam.T @ LUMA), cam_rgb @ np.ones(3) / mul  # camera RGB . lum: luminance; grey has 1
+        _pass("chroma_final", fb(out), {"cam": cam, "chroma": t0, "original": original}, amount=amount, lum=lum, grey=grey, camRgb=cam_rgb.T, **common)
         return out
     finally:
         _release(t0, t1, tmp, m0, m1, coef, mc, *fbs)

@@ -145,6 +145,9 @@ def test_automatic_noise_reduction_follows_iso():
 def test_noise_setting_is_automatic_unless_set():
     assert develop.clean({})["noise"] is None and develop.clean({"noise": None})["noise"] is None
     assert develop.clean({"noise": 100})["noise"] == 100 and develop.clean({"noise": 250})["noise"] == 200
+    assert develop.strengths(develop.clean({"noise": 0, "chroma": None}), 25600) == (0, 1)  # luminance off, colour auto
+    assert develop.clean({"noise": 60})["chroma"] == 60  # saved when one setting did both
+    assert develop.clean({"noise": 60, "chroma": None})["chroma"] is None
 
 
 def test_strength_and_colour_smoothing():
@@ -162,6 +165,13 @@ def test_strength_sets_how_much_grain_is_given_back():
     assert denoise.amount(0) == 0 and denoise.amount(0.5) == 0.75 and denoise.amount(1) == denoise.amount(1.5) == 1
 
 
+def test_luminance_and_colour_strengths_act_apart():
+    color = develop.Color(np.eye(3), np.eye(3), np.ones(3), np.ones(3), 6500.0)
+    noise = denoise.Noise.at(None, color, 25600, (0.5, 1.5))
+    assert noise.weights == denoise.grain_weights(25600, 0.5) and noise.chroma_eps == denoise.chroma_eps(1.5)
+    assert noise.amount == (0.75, 1) and denoise.mixed((0.5, 1.5)) and not denoise.mixed((1, 2))
+
+
 def test_weaker_noise_reduction_mixes_in_the_photo_without(gpu):
     A, B, gain, saturation = 2.0, 60.0, 16, 4095
     mosaic, _ = noisy_mosaic((48, 64), A, B)
@@ -171,15 +181,23 @@ def test_weaker_noise_reduction_mixes_in_the_photo_without(gpu):
     plain = gpu.demosaic(mosaic, PATTERN, BLACK - 22, saturation, 0, xyz, to_cam)
     d = gpu.demosaic(mosaic, PATTERN, BLACK - 22, saturation, 0, xyz, to_cam, nlm=nlm, original=True)
     try:
-        without, _, _ = gpu.read_decoded(plain)
+        demosaiced, _, _ = gpu.read_decoded(plain)
         noise = lambda amount: denoise.Noise(d.removed, np.ones(3), np.eye(3), (0.0, 0.0, 0.0), amount=amount)
-        cam = {amount: gpu.read_decoded(d, noise(amount))[0][..., :3].astype(np.float32) for amount in (0, 0.25, 1)}
+        amounts = [(0, 0), (0.25, 0.25), (1, 1), (1, 0), (0, 1)]
+        cam = {a: gpu.read_decoded(d, noise(a))[0][..., :3].astype(np.float32) for a in amounts}
     finally:
         plain.release()
         d.release()
-    assert np.array_equal(cam[0], without[..., :3])  # the original is demosaiced as it is, to the bit
-    assert np.abs(cam[1] - cam[0]).std() > 0.002  # noise reduced
-    assert np.abs(cam[0.25] - (0.75 * cam[0] + 0.25 * cam[1])).max() < 1e-3
+    without, reduced = cam[0, 0], cam[1, 1]
+    assert np.array_equal(without, demosaiced[..., :3])  # the original is demosaiced as it is, to the bit
+    assert np.abs(reduced - without).std() > 0.002  # noise reduced
+    assert np.abs(cam[0.25, 0.25] - (0.75 * without + 0.25 * reduced)).max() < 1e-3
+    # Luminance and colour apart (camera RGB is scene RGB here: grey is (1, 1, 1)), to float16's
+    # rounding (~0.001 at 1, on both sides)
+    y = lambda img: img @ look.LUMA
+    colour = lambda img: img - y(img)[..., None]
+    assert np.abs(y(cam[1, 0]) - y(reduced)).max() < 2e-3 and np.abs(colour(cam[1, 0]) - colour(without)).max() < 2e-3
+    assert np.abs(y(cam[0, 1]) - y(without)).max() < 2e-3 and np.abs(colour(cam[0, 1]) - colour(reduced)).max() < 2e-3
 
 
 def test_camera_noise_profile_round_trip(tmp_path):
