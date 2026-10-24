@@ -34,7 +34,8 @@ from .look import GRID, LUMA, Look, jpeg_target, load_profile, samples_at
 
 # temp None: as shot. tint 0: the camera's. noise, chroma: luminance and colour noise reduction,
 # None automatic (denoise.strength), else the strength in percent: 0 off, 100 standard, up to 200.
-DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "tint": 0, "saturation": 0, "contrast": 0, "noise": None, "chroma": None}
+# neural: by RawNIND (neural.py) instead of non-local means, which caps both at 100.
+DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "tint": 0, "saturation": 0, "contrast": 0, "noise": None, "chroma": None, "neural": False}
 LIMITS = {
     "compress": (0, 100),
     "exposure": (-4.0, 4.0),
@@ -171,6 +172,9 @@ def clean(settings: dict | None) -> dict:
     for key, value in (settings or {}).items():
         if key not in DEFAULTS or (value is None and DEFAULTS[key] is None):
             continue
+        if key == "neural":
+            out[key] = bool(value)
+            continue
         lo, hi = LIMITS[key]
         value = min(max(float(value), lo), hi)
         if key == "exposure":
@@ -181,6 +185,9 @@ def clean(settings: dict | None) -> dict:
             out[key] = int(round(value))
     if "chroma" not in (settings or {}):  # saved when one setting did both
         out["chroma"] = out["noise"]
+    if out["neural"]:  # RawNIND has nothing stronger than standard
+        for key in ("noise", "chroma"):
+            out[key] = None if out[key] is None else min(out[key], 100)
     return out
 
 
@@ -283,17 +290,17 @@ def decode(data: bytes, half_size: bool) -> tuple[np.ndarray, Color]:
     return rgb, color
 
 
-def decode_full(data: bytes, photo, strength: tuple[float, float]):
-    """decode() at full size; with `strength` (luminance, colour: denoise.strength(), 0: none),
-    noise reduction on the raw data before demosaicing (denoise.py). Also returns what the
-    develop step needs to finish noise reduction (or None), and below standard strength, the
+def decode_full(data: bytes, photo, strength):
+    """decode() at full size; with `strength` (denoise.Reduction), noise reduction on the raw
+    data before demosaicing (denoise.py: non-local means, never RawNIND here). Also returns what
+    the develop step needs to finish noise reduction (or None), and below standard strength, the
     photo decoded without it, to mix in (gpu.upload(original=...); else None)."""
-    typical = load_profile(photo.camera).noise_at(photo.iso) if any(strength) else None
+    typical = load_profile(photo.camera).noise_at(photo.iso) if strength else None
     rgb, color, noise, original, _ = _decode(data, False, strength, photo.iso, typical)
     return rgb, color, noise, original
 
 
-def _decode(data: bytes, half_size: bool, strength: tuple[float, float] = (0.0, 0.0), iso: int | None = None, typical_noise=None):
+def _decode(data: bytes, half_size: bool, strength=None, iso: int | None = None, typical_noise=None):
     """decode(), plus the noise reduction's leftovers, the photo without it (if mixed in) and
     the full-size (width, height)."""
     from . import denoise as dn
@@ -309,10 +316,10 @@ def _decode(data: bytes, half_size: bool, strength: tuple[float, float] = (0.0, 
         saturation = top if top >= 0.98 * raw.white_level else raw.white_level
         pad = min(black, BLACK_PAD)
         gain = 1  # raw values are this many times larger after noise reduction
-        if any(strength) and dn.supported(raw):
+        if strength and dn.supported(raw):
             if dn.mixed(strength):
                 original = raw.postprocess(half_size=half_size, user_black=black - pad, user_sat=saturation, **RAW_LINEAR)
-            removed, gain = dn.raw_nlm(raw, black, 1 / (saturation - black), color, typical_noise, strength[0])
+            removed, gain = dn.raw_nlm(raw, black, 1 / (saturation - black), color, typical_noise, strength.luminance)
             flip = raw.sizes.flip
         rgb = raw.postprocess(half_size=half_size, user_black=gain * (black - pad), user_sat=gain * saturation, **RAW_LINEAR)
 
@@ -328,12 +335,13 @@ def _decode(data: bytes, half_size: bool, strength: tuple[float, float] = (0.0, 
     return linear(rgb), color, noise, None if original is None else linear(original), full_size
 
 
-def _on_gpu(photo, data: bytes, strength: tuple[float, float], base: bool):
+def _on_gpu(photo, data: bytes, strength, base: bool):
     """decode_full() demosaiced on the GPU (gpu.demosaic: the same result, to the bit, without
     LibRaw's slow demosaicing and the copies around it), left there as the develop shader's
     input; the photo's look fitted (if it isn't yet) and with `base`, the base layer worked
-    out, from what the GPU averages down. Returns (gpu.Decoded, color, noise, look, base
-    coefficients or None), or None for a raw LibRaw has to demosaic (not a plain Bayer mosaic)."""
+    out, from what the GPU averages down. With strength.neural, RawNIND demosaics and denoises
+    instead (_neural()). Returns (gpu.Decoded, color, noise, look, base coefficients or None),
+    or None for a raw LibRaw has to demosaic (not a plain Bayer mosaic)."""
     from . import denoise as dn
     from . import gpu
 
@@ -347,9 +355,9 @@ def _on_gpu(photo, data: bytes, strength: tuple[float, float], base: bool):
         top = int(raw.raw_image_visible.max())
         saturation = top if top >= 0.98 * raw.white_level else raw.white_level  # as _decode
         nlm = None
-        if any(strength):
+        if strength and not strength.neural:
             typical = load_profile(photo.camera).noise_at(photo.iso)
-            nlm = dn.nlm_args(raw, black, 1 / (saturation - black), color, typical, strength[0])
+            nlm = dn.nlm_args(raw, black, 1 / (saturation - black), color, typical, strength.luminance)
         mosaic, pattern, cam_xyz = raw.raw_image_visible.copy(), np.asarray(raw.raw_pattern), raw.rgb_xyz_matrix
     flip = sizes.flip
     size = (sizes.height, sizes.width) if flip & 4 else (sizes.width, sizes.height)
@@ -358,16 +366,19 @@ def _on_gpu(photo, data: bytes, strength: tuple[float, float], base: bool):
     look = _looks.get((photo.path, strength))
     jpeg = photo.embedded_jpeg(data) if look is None else None
     target = jpeg_target(size, jpeg) if jpeg else None
-    decoded = gpu.demosaic(
-        mosaic, pattern, black - pad, saturation, flip, cam_xyz, to_cam, nlm=nlm, original=nlm is not None and dn.mixed(strength),
-        look=None if target is None else (target.size, target.box), base=(*base_luminance(color), base_size(*size)) if base else None,
-    )
+    averages = dict(look=None if target is None else (target.size, target.box), base=(*base_luminance(color), base_size(*size)) if base else None)
+    if strength and strength.neural:
+        decoded = _neural(mosaic, pattern, black, saturation, pad, flip, cam_xyz, color, dn.mixed(strength), **averages)
+    else:
+        decoded = gpu.demosaic(
+            mosaic, pattern, black - pad, saturation, flip, cam_xyz, to_cam, nlm=nlm, original=nlm is not None and dn.mixed(strength), **averages
+        )
     try:
         if look is None:
             samples = None if target is None else samples_at(decoded.look, target, color)
             look = _looks[photo.path, strength] = Look.from_samples(samples, photo.camera, photo.iso)
         noise = None
-        if nlm is not None:
+        if decoded.removed is not None:
             noise = dn.Noise.at(dn.orient(decoded.removed, flip), color, photo.iso, strength)
         return decoded, color, noise, look, None if decoded.base is None else coefficients(decoded.base)
     except BaseException:
@@ -375,15 +386,36 @@ def _on_gpu(photo, data: bytes, strength: tuple[float, float], base: bool):
         raise
 
 
+def _neural(mosaic, pattern, black, saturation, pad, flip, cam_xyz, color, mixed: bool, look=None, base=None):
+    """gpu.demosaic() with noise reduction, by RawNIND (neural.py) instead of non-local means
+    and AHD: its camera RGB on the GPU, what it removed (Decoded.removed), and with `mixed`, the
+    photo without noise reduction (Decoded.original: still AHD's)."""
+    from . import denoise as dn
+    from . import gpu, neural
+
+    x = (mosaic.astype(np.float32) - black) / np.float32(saturation - black)  # in our camera RGB's units
+    rgb = neural.denoise(x, pattern)
+    removed = dn.removed(x, rgb, pattern, dn.luminance_weights(pattern, color, 1.0))
+    to_cam = (saturation / 65535 / (saturation - black), pad / (saturation - black))
+    original = gpu.demosaic(mosaic, pattern, black - pad, saturation, flip, cam_xyz, to_cam) if mixed else None
+    try:
+        decoded = gpu.upload(dn.orient(rgb, flip), original, look=look, base=base)
+    finally:
+        if original is not None:
+            original.release()  # nothing left to free once upload() took its camera RGB
+    decoded.removed = removed
+    return decoded
+
+
 # A photo's look is fitted from the full-size data an export develops (with noise reduction or
 # without), so an export comes out the same whether the editor ran first or not. The quick
 # preview fits a provisional one from its half-size data if that isn't there yet; the final
 # view replaces it.
-_looks: dict = {}  # (path, noise reduction strengths) -> Look
+_looks: dict = {}  # (path, denoise.Reduction) -> Look
 _quick_looks: dict = {}  # path -> Look
 
 
-def look_for(photo, data: bytes, rgb: np.ndarray, color: Color, strength: tuple[float, float]) -> Look:
+def look_for(photo, data: bytes, rgb: np.ndarray, color: Color, strength) -> Look:
     """The look, fitted from full-size `rgb` (with noise reduction of `strength`) if it isn't yet."""
     look = _looks.get((photo.path, strength))
     if look is None:
@@ -497,7 +529,7 @@ class Full:
         return cam.tobytes() + grain.tobytes()
 
 
-def full(photo, data: bytes, strength: tuple[float, float], previews=()) -> Full:
+def full(photo, data: bytes, strength, previews=()) -> Full:
     """The export's input for the editor, with its full_preview() at each long side in
     `previews` made already (averaged down on the GPU, ~0.3 s quicker than from the Full)."""
     from . import gpu
@@ -523,11 +555,13 @@ def full(photo, data: bytes, strength: tuple[float, float], previews=()) -> Full
     return out
 
 
-def strengths(settings: dict, iso: int | None) -> tuple[float, float]:
-    """Luminance and colour noise reduction strengths (denoise.strength()) for clean() settings."""
-    from . import denoise
+def reduction(settings: dict, iso: int | None):
+    """How a photo's noise is reduced (denoise.Reduction), for clean() settings: by RawNIND only
+    where it can run (neural.available()), else by non-local means."""
+    from . import denoise, neural
 
-    return denoise.strength(settings["noise"], iso), denoise.strength(settings["chroma"], iso)
+    lum, col = denoise.strength(settings["noise"], iso), denoise.strength(settings["chroma"], iso)
+    return denoise.Reduction(lum, col, settings["neural"] and neural.available())
 
 
 def develop(photo, data: bytes, settings: dict) -> np.ndarray:
@@ -536,7 +570,7 @@ def develop(photo, data: bytes, settings: dict) -> np.ndarray:
 
     s = clean(settings)
     compress = s["compress"] > 0  # else the shader doesn't read the base layer
-    nr = strengths(s, photo.iso)
+    nr = reduction(s, photo.iso)
     on_gpu = _on_gpu(photo, data, nr, base=compress)
     if on_gpu is None:
         rgb, color, noise, original = decode_full(data, photo, nr)

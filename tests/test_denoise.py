@@ -145,7 +145,7 @@ def test_automatic_noise_reduction_follows_iso():
 def test_noise_setting_is_automatic_unless_set():
     assert develop.clean({})["noise"] is None and develop.clean({"noise": None})["noise"] is None
     assert develop.clean({"noise": 100})["noise"] == 100 and develop.clean({"noise": 250})["noise"] == 200
-    assert develop.strengths(develop.clean({"noise": 0, "chroma": None}), 25600) == (0, 1)  # luminance off, colour auto
+    assert develop.reduction(develop.clean({"noise": 0, "chroma": None}), 25600) == denoise.Reduction(0, 1)  # luminance off, colour auto
     assert develop.clean({"noise": 60})["chroma"] == 60  # saved when one setting did both
     assert develop.clean({"noise": 60, "chroma": None})["chroma"] is None
 
@@ -167,9 +167,9 @@ def test_strength_sets_how_much_grain_is_given_back():
 
 def test_luminance_and_colour_strengths_act_apart():
     color = develop.Color(np.eye(3), np.eye(3), np.ones(3), np.ones(3), 6500.0)
-    noise = denoise.Noise.at(None, color, 25600, (0.5, 1.5))
+    noise = denoise.Noise.at(None, color, 25600, denoise.Reduction(0.5, 1.5))
     assert noise.weights == denoise.grain_weights(25600, 0.5) and noise.chroma_eps == denoise.chroma_eps(1.5)
-    assert noise.amount == (0.75, 1) and denoise.mixed((0.5, 1.5)) and not denoise.mixed((1, 2))
+    assert noise.amount == (0.75, 1) and denoise.mixed(denoise.Reduction(0.5, 1.5)) and not denoise.mixed(denoise.Reduction(1, 2))
 
 
 def test_weaker_noise_reduction_mixes_in_the_photo_without(gpu):

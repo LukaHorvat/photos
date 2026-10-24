@@ -16,6 +16,9 @@ Lightroom. Weaker than standard, the standard result is mixed with the photo dem
 without noise reduction, its luminance and its colour separately: a weaker filter, or noise
 left in the mosaic, comes out of AHD with dark worms at high ISO, and giving more grain back
 can't bring back colour noise.
+
+Instead of steps 1 and the demosaicing, a photo can have RawNIND do both (neural.py); steps 2
+and 3 and the mixing stay.
 """
 
 from __future__ import annotations
@@ -42,6 +45,19 @@ CEILING = 1.5  # a photo measuring noisier than this times the camera's typical 
 CEILING_LEVEL = 0.18  # at this level (of the raw range: mid-grey), is denoised as typical instead
 
 
+@dataclass(frozen=True)
+class Reduction:
+    """How a photo's noise is reduced: luminance and colour strengths (strength()), and whether
+    by RawNIND (neural.py) in place of non-local means and AHD."""
+
+    luminance: float
+    colour: float
+    neural: bool = False
+
+    def __bool__(self) -> bool:  # any noise reduction at all
+        return bool(self.luminance or self.colour)
+
+
 @dataclass
 class Noise:
     """What the develop step needs to finish noise reduction after demosaicing."""
@@ -54,9 +70,9 @@ class Noise:
     amount: tuple = (1.0, 1.0)  # luminance, colour: how much is noise reduced, the rest the photo without (gpu.Decoded.original)
 
     @classmethod
-    def at(cls, grain: np.ndarray, color, iso: int | None, strength: tuple[float, float]) -> Noise:
-        """For (luminance, colour) strengths (strength()); color: develop.Color."""
-        lum, col = strength
+    def at(cls, grain: np.ndarray, color, iso: int | None, reduction: Reduction) -> Noise:
+        """For a Reduction; color: develop.Color."""
+        lum, col = reduction.luminance, reduction.colour
         return cls(grain, color.as_shot, color.rgb_cam, grain_weights(iso, lum), chroma_eps(col), (amount(lum), amount(col)))
 
 
@@ -120,9 +136,9 @@ def amount(s: float) -> float:
     return 1 - (1 - min(s, 1.0)) ** 2
 
 
-def mixed(strength: tuple[float, float]) -> bool:
-    """Whether (luminance, colour) strengths mix in the photo without noise reduction."""
-    return min(amount(s) for s in strength) < 1
+def mixed(reduction: Reduction) -> bool:
+    """Whether a Reduction mixes in the photo without noise reduction."""
+    return min(amount(reduction.luminance), amount(reduction.colour)) < 1
 
 
 def supported(raw) -> bool:
@@ -160,15 +176,38 @@ def nlm_args(raw, black: float, scale: float, color, typical: tuple[float, float
     """raw_nlm()'s arguments for gpu.raw_nlm() after the mosaic (the gain last)."""
     mosaic = raw.raw_image_visible
     pattern = np.asarray(raw.raw_pattern)
-    colours = [{0: 0, 1: 1, 2: 2, 3: 1}[int(pattern[p])] for p in PHASES]  # LibRaw calls the second green 3
-    lum = (color.rgb_cam.T @ LUMA) * color.as_shot * scale  # luminance of each camera channel
-    weights = [lum[c] / colours.count(c) for c in colours]  # the two greens are averaged
+    colours = _colours(pattern)
+    weights = luminance_weights(pattern, color, scale)
     gain = max(1, 65535 // max(int(raw.white_level), int(mosaic.max())))
     model = noise_model(mosaic, black, pattern)
     if typical:
         model = trusted(model, typical, CEILING_LEVEL * (raw.white_level - black))
     greens = tuple(k for k, c in enumerate(colours) if c == 1)
     return (black, *model, weights, STRENGTH * max(1.0, s), SEARCH, PATCH, greens, gain)
+
+
+def _colours(pattern) -> list[int]:
+    """The colour (0 R, 1 G, 2 B) of each photosite of a 2x2 tile, in PHASES order."""
+    return [{0: 0, 1: 1, 2: 2, 3: 1}[int(pattern[p])] for p in PHASES]  # LibRaw calls the second green 3
+
+
+def luminance_weights(pattern, color, scale: float) -> list[float]:
+    """Per photosite of a 2x2 tile (PHASES order), its share of the tile's scene luminance (as-shot
+    white balance); scale: raw units -> our normalised camera RGB."""
+    colours = _colours(pattern)
+    lum = (color.rgb_cam.T @ LUMA) * color.as_shot * scale  # luminance of each camera channel
+    return [float(lum[c] / colours.count(c)) for c in colours]  # the two greens are averaged
+
+
+def removed(mosaic: np.ndarray, rgb: np.ndarray, pattern, weights) -> np.ndarray:
+    """What demosaicing and denoising to camera RGB `rgb` (H x W x 3) took out of `mosaic` (H x W,
+    the same units), per 2x2 tile: sum(weights * removed) over its photosites (half size, float32),
+    the grain's source like raw_nlm()'s."""
+    out = np.zeros((mosaic.shape[0] // 2, mosaic.shape[1] // 2), np.float32)
+    for (dy, dx), c, w in zip(PHASES, _colours(pattern), weights):
+        site = np.s_[dy : 2 * out.shape[0] : 2, dx : 2 * out.shape[1] : 2]
+        out += np.float32(w) * (mosaic[site] - rgb[site + (c,)])
+    return out
 
 
 def orient(img: np.ndarray, flip: int) -> np.ndarray:

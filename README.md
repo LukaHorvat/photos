@@ -53,6 +53,17 @@ slider); more smooths further (luminance at 200%: no grain at all); 0 turns it o
 Luminance 0 with colour 100% keeps all the grain but no colour noise.
 They apply when you let go of the slider, as they need the server to redo the photo.
 
+**Neural (RawNIND)**, a toggle under the sliders, has a neural network do the
+demosaicing and denoising instead (`neural.py`): RawNIND (Brummer & De Vleeschouwer,
+2025), the model darktable 5.6 ships as "neural restore". At high ISO its edges and
+colour come out cleaner: AHD draws mazes and combs from noisy data. The colour filter, the
+grain and the sliders still apply, up to 100% (it has no strength of its own; less mixes in
+the photo without, as above). It costs ~1.5 s more per photo and needs an NVIDIA GPU with
+CUDA, through ONNX Runtime: the `neural` dependency group (~2.5 GB, installed by default;
+`uv sync --no-group neural` leaves it out). The model (GPL-3.0, 58 MB) is downloaded from
+darktable-ai's GitHub release on first use, checked against its published SHA-256, and kept
+in `~/.cache/photos`.
+
 It needs to know how noisy the photo is. That's measured in the photo itself, but
 a photo full of fine texture (foliage) would read as very noisy and be smeared, so
 the profile also holds the camera's typical noise per ISO, and a photo measuring
@@ -83,7 +94,7 @@ Everything is saved as you go to `<folder>/.photos.json`:
 ```json
 {
   "marks": {"DSC_9282.NEF": "keep", "DSC_9283.NEF": "reject"},
-  "edits": {"DSC_9290.NEF": {"compress": 40, "exposure": 0.3, "temp": null, "saturation": 10, "contrast": 0, "noise": null, "chroma": null}},
+  "edits": {"DSC_9290.NEF": {"compress": 40, "exposure": 0.3, "temp": null, "saturation": 10, "contrast": 0, "noise": null, "chroma": null, "neural": false}},
   "version": 1
 }
 ```
@@ -91,7 +102,7 @@ Everything is saved as you go to `<folder>/.photos.json`:
 An edit sits on the photo where it starts to apply (`temp: null` means as shot;
 `noise` and `chroma`, luminance and colour noise reduction: `null` automatic, else the
 strength in percent, 0 off, 100 the camera's; an edit saved before `chroma` existed
-uses its `noise` for both).
+uses its `noise` for both; `neural`: by RawNIND).
 
 ## Tests
 

@@ -61,6 +61,7 @@ header {
   cursor: pointer;
 }
 .chip.on { color: var(--hi); border-color: #5a5a5a; }
+.chip:disabled { opacity: 0.4; cursor: default; }
 
 main { position: relative; overflow: hidden; min-height: 0; }
 

@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import denoise, develop, edits, trash
+from . import denoise, develop, edits, neural, trash
 from .export import export_photo
 from .raw import IMAGE_EXTS, RAW_EXTS, Photo, read_file
 
@@ -124,7 +124,7 @@ class Library:
         self.previews = Prefetcher(
             lambda key: develop.preview(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
-        # The export's input at full size, by (name, noise reduction strengths), for the editor's final
+        # The export's input at full size, by (name, denoise.Reduction), for the editor's final
         # views: ~200 MB and 0.6-2 s of work each, for the photo on screen and the next (which
         # waits for it). Two at a time, so a change to the photo on screen needn't wait for the next.
         self.fulls = Prefetcher(
@@ -231,12 +231,12 @@ class Library:
 
     def full_key(self, name: str, noise: str | None = None):
         """fulls key for a photo: its noise reduction settings as the editor has them (luminance,
-        colour: "auto,60"), or as saved."""
+        colour, then "neural" if RawNIND's: "auto,60" or "auto,60,neural"), or as saved."""
         settings = self.settings()[name]
         if noise is not None:
-            lum, col = (None if v == "auto" else float(v) for v in noise.split(","))
-            settings = {**settings, "noise": lum, "chroma": col}
-        return name, develop.strengths(settings, self.photos[name].iso)
+            lum, col, *how = noise.split(",")
+            settings = develop.clean({**settings, "noise": None if lum == "auto" else float(lum), "chroma": None if col == "auto" else float(col), "neural": how == ["neural"]})
+        return name, develop.reduction(settings, self.photos[name].iso)
 
     def runs(self) -> dict:
         """What the editor shows: which photos share settings, and those settings."""
@@ -376,6 +376,7 @@ class Handler(BaseHTTPRequestHandler):
                     "defaults": develop.DEFAULTS,
                     "limits": develop.LIMITS,
                     "autoNoiseIso": denoise.AUTO_ISO,
+                    "neural": neural.available(),
                     "tempStep": develop.TEMP_STEP,
                 }
             )

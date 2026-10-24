@@ -81,11 +81,21 @@ def demosaic(mosaic, pattern, black: int, saturation: int, flip: int, cam_xyz, t
     return _run(_demosaic, mosaic, np.asarray(pattern), int(black), int(saturation), int(flip), xyz, to_cam, nlm, look, base, original)
 
 
-def upload(rgb, original=None) -> Decoded:
-    """Camera RGB (HxWx3 float32) as a Decoded, for what LibRaw demosaics; `original` the same
-    without noise reduction, if it is to be mixed in (Decoded.original)."""
+def upload(rgb, original=None, look=None, base=None) -> Decoded:
+    """Camera RGB (HxWx3 float32) as a Decoded, for what LibRaw or RawNIND (neural.py)
+    demosaics. original: the same without noise reduction, if it is to be mixed in
+    (Decoded.original): an array, or a Decoded whose camera RGB this takes over. look, base: as
+    demosaic() averages them down, from the camera RGB as uploaded (float16)."""
     h, w = rgb.shape[:2]
-    return Decoded(w, h, _run(_upload, _rgba16(rgb)), original=None if original is None else _run(_upload, _rgba16(original)))
+    if base is not None:
+        mul, weights, size = base
+        base = (tuple(np.float32(mul).tolist()), tuple(np.float32(weights).tolist()), size)
+    decoded = Decoded(w, h, *_run(_upload_decoded, _rgba16(rgb), look, base))
+    if isinstance(original, Decoded):
+        decoded.original, original.cam = original.cam, None
+    elif original is not None:
+        decoded.original = _run(_upload, _rgba16(original))
+    return decoded
 
 
 def render(rgb, coeffs, uniforms, tone, table, noise=None) -> np.ndarray:
@@ -524,6 +534,24 @@ BOX = """
     ivec2 boxX() { return texelFetch(boundsX, ivec2(int(gl_FragCoord.x), 0), 0).xy; }
     ivec2 boxY() { return texelFetch(boundsY, ivec2(int(gl_FragCoord.y), 0), 0).xy; }
 """
+FLOAT_CAM = """
+    uniform sampler2D src;  // camera RGB as uploaded (upload())
+    vec3 camAt(ivec2 p) { return texelFetch(src, p, 0).rgb; }
+"""
+# The base layer's luminance, averaged down: min(rgb * mul, min(mul)) . weights
+LUMINANCE = """
+        uniform vec3 mul; uniform vec3 weights;
+        out float v;
+        void main() {
+          ivec2 bx = boxX(), by = boxY();
+          float clipLevel = min(mul.r, min(mul.g, mul.b)), s = 0.0;
+          for (int y = by.x; y < by.y; y++) {
+            float row = 0.0;
+            for (int x = bx.x; x < bx.y; x++) row += dot(min(camAt(ivec2(x, y)) * mul, vec3(clipLevel)), weights);
+            s += row / float(bx.y - bx.x);
+          }
+          v = s / float(by.y - by.x);
+        }"""
 
 SHADERS.update({
     # LibRaw's black subtraction (raw2image_ex) and scaling to 16 bits (scale_colors)
@@ -647,19 +675,8 @@ SHADERS.update({
           }
           v = vec4(s / float(by.y - by.x), 0.0);
         }""",
-    "box_luminance": TO_CAM + BOX + """
-        uniform vec3 mul; uniform vec3 weights;
-        out float v;
-        void main() {
-          ivec2 bx = boxX(), by = boxY();
-          float clipLevel = min(mul.r, min(mul.g, mul.b)), s = 0.0;
-          for (int y = by.x; y < by.y; y++) {
-            float row = 0.0;
-            for (int x = bx.x; x < bx.y; x++) row += dot(min(camAt(ivec2(x, y)) * mul, vec3(clipLevel)), weights);
-            s += row / float(bx.y - bx.x);
-          }
-          v = s / float(by.y - by.x);
-        }""",
+    "box_luminance": TO_CAM + BOX + LUMINANCE,
+    "box_texture_luminance": FLOAT_CAM + BOX + LUMINANCE,
     "box_texture": BOX + """
         uniform sampler2D src;
         out vec4 v;
@@ -914,6 +931,23 @@ def _upload(cam) -> object:
     h, w = cam.shape[:2]
     _check_size(w, h)
     return _texture((w, h), 4, cam, dtype="f2")
+
+
+def _upload_decoded(cam, look, base) -> tuple:
+    """_upload(), and the look and base averaged down from it as _demosaic() does: (texture,
+    look or None, base or None)."""
+    tex = _upload(cam)
+    try:
+        size = (cam.shape[1], cam.shape[0])
+        small = None if look is None else _resize("box_texture", {"src": tex}, size, look[0], look[1], 3)
+        lum = None
+        if base is not None:
+            mul, weights, base_size = base
+            lum = _resize("box_texture_luminance", {"src": tex}, size, base_size, (0, 0, *size), 1, mul=mul, weights=weights)[..., 0]
+        return tex, small, lum
+    except BaseException:
+        _release(tex)
+        raise
 
 
 def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, base, original) -> Decoded:

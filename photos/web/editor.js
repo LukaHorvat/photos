@@ -31,6 +31,7 @@ const ED = {
   previews: new Map(), // name -> { promise, abort, info }: quick previews
   finals: new Map(), // finalKey -> the same: what the export will be (develop.full_preview)
   autoNoiseIso: null,
+  neural: false, // whether the server can run RawNIND
   cells: [],
   saving: Promise.resolve(),
 };
@@ -110,10 +111,12 @@ function formatValue(key, v) {
 }
 
 // Noise reduction, luminance (noise) and colour (chroma): each null automatic (the server
-// decides by ISO), else its strength in % of the camera's, 0 off. They change the data the
-// server sends, so they apply on release. The server takes the two as one: 'auto,60'.
+// decides by ISO), else its strength in % of the camera's, 0 off; by RawNIND if neural, up to
+// 100%. They change the data the server sends, so they apply on release. The server takes
+// them as one: 'auto,60', or 'auto,60,neural'.
 const NR_KEYS = ['noise', 'chroma'];
-const nrOf = (settings) => NR_KEYS.map((k) => settings?.[k] ?? 'auto').join(',');
+const nrOf = (settings) => [...NR_KEYS.map((k) => settings?.[k] ?? 'auto'), ...(settings?.neural ? ['neural'] : [])].join(',');
+const neuralChip = $('#neural');
 const finalKey = (name, nr) => `${name}|${nr}`;
 const currentKey = () => editCurrent() && finalKey(editCurrent(), nrOf(ED.live));
 const reducing = (name, settings) => NR_KEYS.some((k) => nrExpected(name, settings?.[k]));
@@ -152,6 +155,7 @@ function updateSliders() {
       const t = v ?? asShotTemp();
       input.value = t ? tempToSlider(t) : 500;
     } else if (NR_KEYS.includes(key)) {
+      input.max = ED.live?.neural ? 100 : ED.limits?.[key][1] ?? 200;
       input.value = v ?? (nrExpected(editCurrent(), null) ? 100 : 0);
     } else {
       input.value = v;
@@ -160,7 +164,16 @@ function updateSliders() {
     label.textContent = ED.live ? formatValue(key, v) : '';
     label.classList.toggle('default', v === ED.defaults?.[key]);
   }
+  neuralChip.classList.toggle('on', !!ED.live?.neural);
+  neuralChip.disabled = !ED.neural && !ED.live?.neural;
 }
+
+neuralChip.addEventListener('click', () => {
+  if (!ED.live) return;
+  const neural = !ED.live.neural;
+  const cap = (v) => (neural && v != null ? Math.min(v, 100) : v);
+  setSettings({ ...ED.live, neural, noise: cap(ED.live.noise), chroma: cap(ED.live.chroma) });
+});
 
 for (const el of SLIDERS) {
   const key = el.dataset.key;
@@ -480,11 +493,11 @@ const PICK_HINT = {
 function setPicking(kind) {
   ED.picking = kind;
   editView.classList.toggle('picking', !!kind);
-  for (const b of document.querySelectorAll('.pickers button')) b.classList.toggle('on', b.dataset.pick === kind);
+  for (const b of document.querySelectorAll('.pickers button[data-pick]')) b.classList.toggle('on', b.dataset.pick === kind);
   requestDraw();
 }
 
-for (const b of document.querySelectorAll('.pickers button')) {
+for (const b of document.querySelectorAll('.pickers button[data-pick]')) {
   b.addEventListener('click', () => setPicking(ED.picking === b.dataset.pick ? null : b.dataset.pick));
 }
 
@@ -786,7 +799,9 @@ async function editorEnter(name) {
       limits: st.limits,
       tempStep: st.tempStep,
       autoNoiseIso: st.autoNoiseIso,
+      neural: st.neural,
     });
+    if (!ED.neural) neuralChip.title += ' Not available here: it needs an NVIDIA GPU with CUDA (and the neural dependencies, see the README).';
     applyRuns(st);
     for (const el of SLIDERS) {
       const input = el.querySelector('input');

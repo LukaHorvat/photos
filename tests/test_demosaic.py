@@ -111,6 +111,19 @@ def test_demosaic_averages_down_like_pil(gpu):
         assert np.allclose(d.base, np.asarray(Image.fromarray(lum).resize((23, 15), Image.Resampling.BOX)), rtol=1e-5, atol=0)
 
 
+def test_upload_averages_down_like_pil(gpu):
+    """The same as demosaic() does, for camera RGB uploaded (RawNIND's), as float16."""
+    rng = np.random.default_rng(6)
+    rgb = rng.uniform(-0.01, 1.0, (60, 90, 3)).astype(np.float16).astype(np.float32)
+    box, mul, weights = (2.5, 1.0, 57.25, 55.0), np.float32([2.0, 1.0, 1.5]), np.float32([0.3, 0.6, 0.1])
+    d = gpu.upload(rgb, look=((17, 11), box), base=(mul, weights, (23, 15)))
+    d.release()
+    pil = np.stack([np.asarray(Image.fromarray(np.ascontiguousarray(rgb[..., c])).resize((17, 11), Image.Resampling.BOX, box=box)) for c in range(3)], -1)
+    assert np.allclose(d.look, pil, rtol=1e-5, atol=1e-7)
+    lum = np.minimum(rgb * mul, mul.min()) @ weights
+    assert np.allclose(d.base, np.asarray(Image.fromarray(lum).resize((23, 15), Image.Resampling.BOX)), rtol=1e-5, atol=1e-7)
+
+
 def test_shrinking_on_the_gpu_is_develops_shrink(gpu):
     from photos import develop
 
