@@ -46,14 +46,16 @@ class Decoded:
     look: np.ndarray | None = None  # demosaic(look=...)
     base: np.ndarray | None = None  # demosaic(base=...)
     removed: np.ndarray | None = None  # demosaic(nlm=...): what raw_nlm() returns as removed
+    original: object = None  # demosaic(original=True), upload(original=...): camera RGB without noise reduction
 
     def release(self):
-        if self.cam is not None:
-            _run(_release, self.cam)
-            self.cam = None
+        textures = [t for t in (self.cam, self.original) if t is not None]
+        if textures:
+            _run(_release, *textures)
+        self.cam = self.original = None
 
 
-def demosaic(mosaic, pattern, black: int, saturation: int, flip: int, cam_xyz, to_cam, nlm=None, look=None, base=None) -> Decoded:
+def demosaic(mosaic, pattern, black: int, saturation: int, flip: int, cam_xyz, to_cam, nlm=None, look=None, base=None, original=False) -> Decoded:
     """What LibRaw's postprocess() makes of a Bayer mosaic with develop.RAW_LINEAR, then as
     camera RGB on the GPU: value * to_cam[0] - to_cam[1], in float32 like develop._decode.
 
@@ -62,7 +64,10 @@ def demosaic(mosaic, pattern, black: int, saturation: int, flip: int, cam_xyz, t
     the same for every colour); flip: LibRaw's sizes.flip; cam_xyz: rawpy's rgb_xyz_matrix,
     which AHD's CIELab needs. LibRaw's AHD is ported exactly: the result is the same to the bit.
 
-    nlm: raw_nlm()'s arguments after the mosaic, to denoise it first (Decoded.removed).
+    nlm: raw_nlm()'s arguments after the mosaic, to denoise it first (Decoded.removed); black
+        and saturation then scale with its gain.
+    original: with nlm, also demosaic the mosaic as it is (Decoded.original), for a weaker
+        noise reduction to mix in (denoise.Noise.amount).
     look: ((width, height), box): camera RGB averaged down over box (x0, y0, x1, y1) as PIL's
         BOX resize does it, read back as Decoded.look (float32, height x width x 3).
     base: (mul, weights, (width, height)): luminance min(rgb * mul, min(mul)) @ weights averaged
@@ -73,13 +78,14 @@ def demosaic(mosaic, pattern, black: int, saturation: int, flip: int, cam_xyz, t
     if base is not None:
         mul, weights, size = base
         base = (tuple(np.float32(mul).tolist()), tuple(np.float32(weights).tolist()), size)
-    return _run(_demosaic, mosaic, np.asarray(pattern), int(black), int(saturation), int(flip), xyz, to_cam, nlm, look, base)
+    return _run(_demosaic, mosaic, np.asarray(pattern), int(black), int(saturation), int(flip), xyz, to_cam, nlm, look, base, original)
 
 
-def upload(rgb) -> Decoded:
-    """Camera RGB (HxWx3 float32) as a Decoded, for what LibRaw demosaics."""
+def upload(rgb, original=None) -> Decoded:
+    """Camera RGB (HxWx3 float32) as a Decoded, for what LibRaw demosaics; `original` the same
+    without noise reduction, if it is to be mixed in (Decoded.original)."""
     h, w = rgb.shape[:2]
-    return Decoded(w, h, _run(_upload, _rgba16(rgb)))
+    return Decoded(w, h, _run(_upload, _rgba16(rgb)), original=None if original is None else _run(_upload, _rgba16(original)))
 
 
 def render(rgb, coeffs, uniforms, tone, table, noise=None) -> np.ndarray:
@@ -99,7 +105,7 @@ def render_decoded(decoded: Decoded, coeffs, uniforms, tone, table, noise=None) 
     Conversions happen here, on the caller's thread, so the GL thread only does GL work
     (it is shared by all exports)."""
     grain = None if noise is None else _f32(noise.grain)
-    out = _run(_render, decoded.cam, _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain)
+    out = _run(_render, decoded.cam, _f32(coeffs), uniforms, _f32(tone), _f32(table), noise, grain, decoded.original)
     # GL reads the bottom row first. Drawing upside down instead would need a vertex shader
     # of its own, and change a few pixels by a bit (sampling positions computed differently).
     return np.ascontiguousarray(out[::-1])
@@ -107,14 +113,15 @@ def render_decoded(decoded: Decoded, coeffs, uniforms, tone, table, noise=None) 
 
 def read_decoded(decoded: Decoded, noise=None, shrink=()) -> tuple[np.ndarray, np.ndarray | None, dict]:
     """What render_decoded() feeds the develop shader, read back: camera RGB (HxWx4 float16),
-    with `noise` its colour noise smoothed, and the grain to give back (HxW float16) or None.
+    with `noise` its colour noise smoothed (and Decoded.original mixed in), and the grain to
+    give back (HxW float16) or None.
     The editor's 100% view runs the shader on these in the browser, so it shows the export.
 
     And for each (width, height) in `shrink`, both averaged down to it as PIL's BOX resize does
     it (develop._shrink): {size: (camera RGB, grain or None)}, float32."""
     h, w = decoded.height, decoded.width
     grain = None if noise is None else _f32(noise.grain)
-    cam, grain, small = _run(_read_cam, decoded.cam, noise, grain, tuple(shrink))
+    cam, grain, small = _run(_read_cam, decoded.cam, noise, grain, tuple(shrink), decoded.original)
     return np.frombuffer(cam, np.float16).reshape(h, w, 4), None if grain is None else np.frombuffer(grain, np.float16).reshape(h, w), small
 
 
@@ -403,10 +410,11 @@ SHADERS = {
           t0 = vec4(I, ch, I * I);
           t1 = vec4(I * ch, 0.0, 0.0);
         }""",
-    # Full size again: the pixel's own luminance, the smoothed chroma (bilinear), back to camera RGB.
+    # Full size again: the pixel's own luminance, the smoothed chroma (bilinear), back to camera
+    # RGB. Mixed with the photo without noise reduction, for a weaker one.
     "chroma_final": """
         uniform sampler2D cam; uniform sampler2D chroma; uniform vec3 mul; uniform float clipLevel; uniform mat3 rgbCam;
-        uniform mat3 camRgb;
+        uniform mat3 camRgb; uniform sampler2D original; uniform float amount;
         out vec4 result;
         void main() {
           ivec2 p = ivec2(gl_FragCoord.xy);
@@ -415,7 +423,8 @@ SHADERS = {
           vec2 ch = texture(chroma, gl_FragCoord.xy / vec2(textureSize(cam, 0))).gb;
           float g = dot(s, vec3(0.25, 0.5, 0.25)) - 0.25 * (ch.x + ch.y);
           vec3 s2 = vec3(g + ch.x, g, g + ch.y);
-          result = vec4((camRgb * (sign(s2) * s2 * s2)) / mul, 1.0);
+          vec3 nr = (camRgb * (sign(s2) * s2 * s2)) / mul;
+          result = vec4(amount < 1.0 ? mix(texelFetch(original, p, 0).rgb, nr, amount) : nr, 1.0);
         }""",
     # Grain: the removed luminance (half size) at full size, blurred at three scales (box
     # radius 1, 2 and 4 twice over, i.e. tent filters) and given back per scale. Rows, then columns.
@@ -901,40 +910,26 @@ def _upload(cam) -> object:
     return _texture((w, h), 4, cam, dtype="f2")
 
 
-def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, base) -> Decoded:
-    ctx = _setup()["ctx"]
+def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, base, original) -> Decoded:
     h, w = mosaic.shape
     size, out = (w, h), ((h, w) if flip & 4 else (w, h))
     _check_size(w, h)
-    owned = []
-
-    def tex(*args, **kwargs):
-        owned.append(_texture(*args, **kwargs))
-        return owned[-1]
-
-    def fb(*texs):
-        owned.append(ctx.framebuffer(list(texs)))
-        return owned[-1]
-
-    cam = None
+    pat = tuple(1 if c == 3 else int(c) for c in pattern.ravel())  # the second green is green
+    raw = _texture(size, 1, mosaic, dtype="u2")
+    owned, orig, cam = [raw], None, None
     try:
-        raw, removed = tex(size, 1, mosaic, dtype="u2"), None
+        if original:
+            rgb, orig = _ahd(raw, pat, black, saturation, flip, xyz, to_cam, out)
+            _release(rgb)  # its textures are reused below
+        removed, gain = None, 1
         if nlm is not None:
             raw, removed_tex = _nlm(raw, size, *nlm)
             owned += [raw, removed_tex]
             removed = np.frombuffer(_read(removed_tex), np.float32).reshape(h // 2, w // 2)
-        pat = tuple(1 if c == 3 else int(c) for c in pattern.ravel())  # the second green is green
-        scaled, green, homo = tex(size, 1, dtype="u2"), tex(size, 2, dtype="u2"), tex(size, 2, dtype="u1")
-        lab_h, lab_v, rgb = tex(size, 4, dtype="i2"), tex(size, 4, dtype="i2"), tex(out, 4, dtype="u2")
-        cbrt = tex((256, 256), 1, _cbrt_table())
-        _pass("ahd_scale", fb(scaled), {"raw": raw}, black=black, scale=float(np.float32(65535) / np.float32(saturation)))
-        _pass("ahd_green", fb(green), {"mosaic": scaled}, pat=pat)
-        lab = {"mosaic": scaled, "green": green, "cbrtTable": cbrt}
-        _pass("ahd_lab", fb(lab_h, lab_v), lab, pat=pat, xc0=xyz[:, 0], xc1=xyz[:, 1], xc2=xyz[:, 2])
-        _pass("ahd_homo", fb(homo), {"labH": lab_h, "labV": lab_v})
-        cam = _texture(out, 4, dtype="f2")
-        _pass("ahd_combine", fb(rgb, cam), {"mosaic": scaled, "green": green, "homo": homo}, pat=pat, flip=flip, toCam=to_cam)
-        decoded = Decoded(out[0], out[1], cam, removed=removed)
+            gain = nlm[-1]
+        rgb, cam = _ahd(raw, pat, gain * black, gain * saturation, flip, xyz, to_cam, out)
+        owned.append(rgb)
+        decoded = Decoded(out[0], out[1], cam, removed=removed, original=orig)
         if look is not None:
             look_size, box = look
             decoded.look = _resize("box_cam", {"rgb": rgb}, out, look_size, box, 3, toCam=to_cam)
@@ -943,11 +938,45 @@ def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, 
             decoded.base = _resize("box_luminance", {"rgb": rgb}, out, base_size, (0, 0, *out), 1, toCam=to_cam, mul=mul, weights=weights)[..., 0]
         return decoded
     except BaseException:
-        if cam is not None:
-            _release(cam)
+        _release(*[t for t in (orig, cam) if t is not None])
         raise
     finally:
         _release(*owned)
+
+
+def _ahd(raw, pat, black, saturation, flip, xyz, to_cam, out) -> tuple:
+    """LibRaw's AHD of the mosaic texture `raw`: its RGB (16-bit, oriented to size `out`, as
+    LibRaw outputs it) and that as camera RGB (RGBA16F), to hand back with _release."""
+    ctx = _setup()["ctx"]
+    size = raw.size
+    temps = []
+
+    def tex(*args, **kwargs):
+        temps.append(_texture(*args, **kwargs))
+        return temps[-1]
+
+    def fb(*texs):
+        temps.append(ctx.framebuffer(list(texs)))
+        return temps[-1]
+
+    rgb = cam = None
+    try:
+        scaled, green, homo = tex(size, 1, dtype="u2"), tex(size, 2, dtype="u2"), tex(size, 2, dtype="u1")
+        lab_h, lab_v = tex(size, 4, dtype="i2"), tex(size, 4, dtype="i2")
+        cbrt = tex((256, 256), 1, _cbrt_table())
+        _pass("ahd_scale", fb(scaled), {"raw": raw}, black=black, scale=float(np.float32(65535) / np.float32(saturation)))
+        _pass("ahd_green", fb(green), {"mosaic": scaled}, pat=pat)
+        lab = {"mosaic": scaled, "green": green, "cbrtTable": cbrt}
+        _pass("ahd_lab", fb(lab_h, lab_v), lab, pat=pat, xc0=xyz[:, 0], xc1=xyz[:, 1], xc2=xyz[:, 2])
+        _pass("ahd_homo", fb(homo), {"labH": lab_h, "labV": lab_v})
+        rgb, cam = _texture(out, 4, dtype="u2"), _texture(out, 4, dtype="f2")
+        _pass("ahd_combine", fb(rgb, cam), {"mosaic": scaled, "green": green, "homo": homo}, pat=pat, flip=flip, toCam=to_cam)
+        return rgb, cam
+    except BaseException:
+        _release(*[t for t in (rgb, cam) if t is not None])
+        raise
+    finally:
+        _release(*temps)
 
 
 def _resize(shader: str, source: dict, in_size, size, box, components: int, **uniforms) -> np.ndarray:
@@ -965,8 +994,9 @@ def _resize(shader: str, source: dict, in_size, size, box, components: int, **un
         _release(bx, by, small, fb)
 
 
-def _chroma_nr(cam, size, mul, rgb_cam, eps):
-    """Camera RGB with colour noise smoothed (RGBA16F texture); eps: denoise.chroma_eps()."""
+def _chroma_nr(cam, size, mul, rgb_cam, eps, original=None, amount=1.0):
+    """Camera RGB with colour noise smoothed (RGBA16F texture); eps: denoise.chroma_eps(). Mixed
+    with `original` (camera RGB without noise reduction), `amount` of it smoothed."""
     import moderngl
 
     from . import denoise
@@ -993,7 +1023,8 @@ def _chroma_nr(cam, size, mul, rgb_cam, eps):
             _pass("chroma_apply", fb(t0, t1), {"t0in": t0, "mc": mc})
         t0.filter = (moderngl.LINEAR, moderngl.LINEAR)
         out = _texture(size, 4, dtype="f2")
-        _pass("chroma_final", fb(out), {"cam": cam, "chroma": t0}, camRgb=np.linalg.inv(rgb_cam).T, **common)
+        original, amount = (cam, 1.0) if original is None else (original, amount)
+        _pass("chroma_final", fb(out), {"cam": cam, "chroma": t0, "original": original}, amount=amount, camRgb=np.linalg.inv(rgb_cam).T, **common)
         return out
     finally:
         _release(t0, t1, tmp, m0, m1, coef, mc, *fbs)
@@ -1013,16 +1044,17 @@ def _grain(removed, weights, size):
         _release(half, rows, *fbs)
 
 
-def _with_noise(cam, noise, removed, size) -> tuple:
-    """The develop shader's camera RGB and grain textures, from the camera RGB texture."""
-    smoothed = _chroma_nr(cam, size, noise.as_shot.astype(np.float32), noise.rgb_cam, noise.chroma_eps)
+def _with_noise(cam, noise, removed, size, original=None) -> tuple:
+    """The develop shader's camera RGB and grain textures, from the camera RGB texture (and the
+    one without noise reduction, to mix in: Decoded.original)."""
+    smoothed = _chroma_nr(cam, size, noise.as_shot.astype(np.float32), noise.rgb_cam, noise.chroma_eps, original, noise.amount)
     return smoothed, _grain(removed, noise.weights, size)
 
 
-def _read_cam(cam, noise, removed, shrink) -> tuple:
+def _read_cam(cam, noise, removed, shrink, original) -> tuple:
     grain, owned = None, []
     if noise is not None:
-        cam, grain = owned = _with_noise(cam, noise, removed, cam.size)
+        cam, grain = owned = _with_noise(cam, noise, removed, cam.size, original)
     try:
         small = {}
         for size in shrink:
@@ -1033,7 +1065,7 @@ def _read_cam(cam, noise, removed, shrink) -> tuple:
         _release(*owned)
 
 
-def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
+def _render(cam, coeffs, uniforms, tone, table, noise, removed, original) -> np.ndarray:
     """sRGB, HxWx3 uint8, bottom row first, from the camera RGB texture `cam`."""
     import moderngl
 
@@ -1042,7 +1074,7 @@ def _render(cam, coeffs, uniforms, tone, table, noise, removed) -> np.ndarray:
     w, h = cam.size
     owned = []
     if noise is not None:
-        cam, grain = _with_noise(cam, noise, removed, (w, h))
+        cam, grain = _with_noise(cam, noise, removed, (w, h), original)
         owned.append(cam)
     else:
         grain = _texture((1, 1), 1, np.zeros((1, 1), np.float32))

@@ -46,8 +46,9 @@ raw data before demosaicing; colour noise smoothed along brightness edges; then
 part of the removed grain given back, more at lower ISO, as the camera keeps it.
 It runs on the GPU, about 0.3 s per photo in a batch. Like the camera's, it's on
 from ISO 1000 (Auto); the editor's Noise reduction slider overrides that per photo (and,
-like the other sliders, for the rest of its series): 100% is the camera's, less gives
-more of the grain back, more smooths further (200%: no grain at all), 0 turns it off.
+like the other sliders, for the rest of its series): 100% is the camera's, less mixes in
+the photo without noise reduction (the noise left falls as (1 - s)², which looks even
+across the slider), more smooths further (200%: no grain at all), 0 turns it off.
 It applies when you let go of the slider, as it needs the server to redo the photo.
 
 It needs to know how noisy the photo is. That's measured in the photo itself, but

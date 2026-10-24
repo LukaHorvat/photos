@@ -276,24 +276,26 @@ def decode(data: bytes, half_size: bool) -> tuple[np.ndarray, Color]:
     Noise below the black level is kept (as negative values): LibRaw is given a black
     level BLACK_PAD lower than the real one, and the difference is subtracted here.
     """
-    rgb, color, _, _ = _decode(data, half_size)
+    rgb, color, *_ = _decode(data, half_size)
     return rgb, color
 
 
 def decode_full(data: bytes, photo, strength: float):
     """decode() at full size; with `strength` (denoise.strength(), 0: none), noise reduction
     on the raw data before demosaicing (denoise.py). Also returns what the develop step needs
-    to finish noise reduction (or None)."""
+    to finish noise reduction (or None), and below standard strength, the photo decoded
+    without it, to mix in (gpu.upload(original=...); else None)."""
     typical = load_profile(photo.camera).noise_at(photo.iso) if strength else None
-    rgb, color, noise, _ = _decode(data, False, strength, photo.iso, typical)
-    return rgb, color, noise
+    rgb, color, noise, original, _ = _decode(data, False, strength, photo.iso, typical)
+    return rgb, color, noise, original
 
 
 def _decode(data: bytes, half_size: bool, strength: float = 0.0, iso: int | None = None, typical_noise=None):
-    """decode(), plus the noise reduction's leftovers and the full-size (width, height)."""
+    """decode(), plus the noise reduction's leftovers, the photo without it (if mixed in) and
+    the full-size (width, height)."""
     from . import denoise as dn
 
-    removed = None
+    removed = original = None
     with rawpy.imread(io.BytesIO(data)) as raw:
         sizes = raw.sizes
         full_size = (sizes.height, sizes.width) if sizes.flip in (5, 6) else (sizes.width, sizes.height)
@@ -302,20 +304,25 @@ def _decode(data: bytes, half_size: bool, strength: float = 0.0, iso: int | None
         # Lossy NEFs saturate a few codes under the nominal white level (see raw.Photo.clipping_mask).
         top = int(raw.raw_image_visible.max())
         saturation = top if top >= 0.98 * raw.white_level else raw.white_level
+        pad = min(black, BLACK_PAD)
         gain = 1  # raw values are this many times larger after noise reduction
         if strength and dn.supported(raw):
+            if dn.amount(strength) < 1:
+                original = raw.postprocess(half_size=half_size, user_black=black - pad, user_sat=saturation, **RAW_LINEAR)
             removed, gain = dn.raw_nlm(raw, black, 1 / (saturation - black), color, typical_noise, strength)
             flip = raw.sizes.flip
-        pad = min(black, BLACK_PAD)
         rgb = raw.postprocess(half_size=half_size, user_black=gain * (black - pad), user_sat=gain * saturation, **RAW_LINEAR)
-    # LibRaw outputs (raw - user_black) * 65535 / user_sat.
-    rgb = rgb.astype(np.float32)
-    rgb *= np.float32(saturation / 65535 / (saturation - black))
-    rgb -= np.float32(pad / (saturation - black))
+
+    def linear(img):  # LibRaw outputs (raw - user_black) * 65535 / user_sat.
+        img = img.astype(np.float32)
+        img *= np.float32(saturation / 65535 / (saturation - black))
+        img -= np.float32(pad / (saturation - black))
+        return img
+
     noise = None
     if removed is not None:
-        noise = dn.Noise(dn.orient(removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(iso, strength), dn.chroma_eps(strength))
-    return rgb, color, noise, full_size
+        noise = dn.Noise(dn.orient(removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(iso, strength), dn.chroma_eps(strength), dn.amount(strength))
+    return linear(rgb), color, noise, None if original is None else linear(original), full_size
 
 
 def _on_gpu(photo, data: bytes, strength: float, base: bool):
@@ -336,11 +343,10 @@ def _on_gpu(photo, data: bytes, strength: float, base: bool):
         black = black_levels.pop()
         top = int(raw.raw_image_visible.max())
         saturation = top if top >= 0.98 * raw.white_level else raw.white_level  # as _decode
-        nlm, gain = None, 1
+        nlm = None
         if strength:
             typical = load_profile(photo.camera).noise_at(photo.iso)
             nlm = dn.nlm_args(raw, black, 1 / (saturation - black), color, typical, strength)
-            gain = nlm[-1]
         mosaic, pattern, cam_xyz = raw.raw_image_visible.copy(), np.asarray(raw.raw_pattern), raw.rgb_xyz_matrix
     flip = sizes.flip
     size = (sizes.height, sizes.width) if flip & 4 else (sizes.width, sizes.height)
@@ -350,7 +356,7 @@ def _on_gpu(photo, data: bytes, strength: float, base: bool):
     jpeg = photo.embedded_jpeg(data) if look is None else None
     target = jpeg_target(size, jpeg) if jpeg else None
     decoded = gpu.demosaic(
-        mosaic, pattern, gain * (black - pad), gain * saturation, flip, cam_xyz, to_cam, nlm=nlm,
+        mosaic, pattern, black - pad, saturation, flip, cam_xyz, to_cam, nlm=nlm, original=nlm is not None and dn.amount(strength) < 1,
         look=None if target is None else (target.size, target.box), base=(*base_luminance(color), base_size(*size)) if base else None,
     )
     try:
@@ -359,7 +365,7 @@ def _on_gpu(photo, data: bytes, strength: float, base: bool):
             look = _looks[photo.path, strength] = Look.from_samples(samples, photo.camera, photo.iso)
         noise = None
         if nlm is not None:
-            noise = dn.Noise(dn.orient(decoded.removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(photo.iso, strength), dn.chroma_eps(strength))
+            noise = dn.Noise(dn.orient(decoded.removed, flip), color.as_shot, color.rgb_cam, dn.grain_weights(photo.iso, strength), dn.chroma_eps(strength), dn.amount(strength))
         return decoded, color, noise, look, None if decoded.base is None else coefficients(decoded.base)
     except BaseException:
         decoded.release()
@@ -401,7 +407,7 @@ def preview(photo, data: bytes, long_side: int) -> bytes:
     This is the quick one, from a half-size decode without noise reduction (~0.5 s);
     full_preview() is what an export will be, shrunk.
     """
-    rgb, color, _, full_size = _decode(data, half_size=True)
+    rgb, color, _, _, full_size = _decode(data, half_size=True)
     with ThreadPoolExecutor(1) as ex:  # the look fit and the shrink don't need each other, and mostly let go of the GIL
         small = ex.submit(_shrink, rgb, long_side)
         look = quick_look(photo, data, rgb, color)
@@ -495,11 +501,11 @@ def full(photo, data: bytes, strength: float, previews=()) -> Full:
 
     on_gpu = _on_gpu(photo, data, strength, base=False)
     if on_gpu is None:
-        rgb, color, noise = decode_full(data, photo, strength)
+        rgb, color, noise, original = decode_full(data, photo, strength)
         look = look_for(photo, data, rgb, color, strength)
         if noise is None:
             return Full(rgb.astype(np.float16), None, color, look)
-        decoded = gpu.upload(rgb)
+        decoded = gpu.upload(rgb, original)
     else:
         decoded, color, noise, look, _ = on_gpu
     w, h = decoded.width, decoded.height
@@ -523,10 +529,10 @@ def develop(photo, data: bytes, settings: dict) -> np.ndarray:
     nr = denoise.strength(s["noise"], photo.iso)
     on_gpu = _on_gpu(photo, data, nr, base=compress)
     if on_gpu is None:
-        rgb, color, noise = decode_full(data, photo, nr)
+        rgb, color, noise, original = decode_full(data, photo, nr)
         look = look_for(photo, data, rgb, color, nr)
         coeffs = base_coefficients(rgb, color) if compress else None
-        decoded = gpu.upload(rgb)
+        decoded = gpu.upload(rgb, original)
     else:
         decoded, color, noise, look, coeffs = on_gpu
     try:

@@ -156,11 +156,30 @@ def test_strength_sets_how_much_grain_is_given_back():
     for iso in (1000, 6400, 25600):
         standard = denoise.grain_weights(iso)
         assert denoise.grain_weights(iso, 1) == standard
-        weaker = denoise.grain_weights(iso, 0.5)
-        assert all(w > s if s < 1 else w == s for w, s in zip(weaker, standard))  # more back, unless that was all already
-        assert denoise.grain_weights(iso, 0) == pytest.approx(tuple(max(w, 1) for w in standard))  # all of it
+        assert denoise.grain_weights(iso, 0.5) == pytest.approx(tuple(0.75 * w for w in standard))  # a quarter is without
         assert denoise.grain_weights(iso, 1.5) == pytest.approx(tuple(w / 2 for w in standard))  # stronger: less
-        assert denoise.grain_weights(iso, 2) == (0, 0, 0)
+        assert denoise.grain_weights(iso, 0) == denoise.grain_weights(iso, 2) == (0, 0, 0)
+    assert denoise.amount(0) == 0 and denoise.amount(0.5) == 0.75 and denoise.amount(1) == denoise.amount(1.5) == 1
+
+
+def test_weaker_noise_reduction_mixes_in_the_photo_without(gpu):
+    A, B, gain, saturation = 2.0, 60.0, 16, 4095
+    mosaic, _ = noisy_mosaic((48, 64), A, B)
+    xyz = np.array([[0.8821, -0.2938, -0.0785], [-0.4178, 1.2142, 0.2287], [-0.0824, 0.1651, 0.6860]], np.float32)  # the D3500's
+    to_cam = (saturation / 65535 / (saturation - BLACK), 22 / (saturation - BLACK))
+    nlm = (BLACK, A, B, [0.25] * 4, denoise.STRENGTH, denoise.SEARCH, denoise.PATCH, (1, 2), gain)
+    plain = gpu.demosaic(mosaic, PATTERN, BLACK - 22, saturation, 0, xyz, to_cam)
+    d = gpu.demosaic(mosaic, PATTERN, BLACK - 22, saturation, 0, xyz, to_cam, nlm=nlm, original=True)
+    try:
+        without, _, _ = gpu.read_decoded(plain)
+        noise = lambda amount: denoise.Noise(d.removed, np.ones(3), np.eye(3), (0.0, 0.0, 0.0), amount=amount)
+        cam = {amount: gpu.read_decoded(d, noise(amount))[0][..., :3].astype(np.float32) for amount in (0, 0.25, 1)}
+    finally:
+        plain.release()
+        d.release()
+    assert np.array_equal(cam[0], without[..., :3])  # the original is demosaiced as it is, to the bit
+    assert np.abs(cam[1] - cam[0]).std() > 0.002  # noise reduced
+    assert np.abs(cam[0.25] - (0.75 * cam[0] + 0.25 * cam[1])).max() < 1e-3
 
 
 def test_camera_noise_profile_round_trip(tmp_path):

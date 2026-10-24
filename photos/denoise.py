@@ -10,6 +10,10 @@
    edges (gpu.py), at half resolution like a JPEG's colour.
 3. Part of the removed luminance noise is given back, separately per scale, so the result
    has the camera's fine grain instead of looking plastic (in the develop shader).
+
+Weaker than standard (strength()), the standard result is mixed with the photo demosaiced
+without noise reduction: a weaker filter, or noise left in the mosaic, comes out of AHD with
+dark worms at high ISO, and giving more grain back can't bring back colour noise.
 """
 
 from __future__ import annotations
@@ -45,16 +49,16 @@ class Noise:
     rgb_cam: np.ndarray
     weights: tuple  # how much of the grain is given back per scale (grain_weights())
     chroma_eps: float = CHROMA_EPS  # colour smoothing (chroma_eps())
+    amount: float = 1.0  # how much of the result is noise reduced, the rest the photo without (gpu.Decoded.original)
 
 
 def grain_weights(iso: int | None, s: float = 1.0) -> tuple:
     """How much of the removed noise is given back, per scale: at strength `s` 1 (strength())
-    the camera's texture for this ISO; below 1 more of it, all at 0; above 1 less, none at 2."""
+    the camera's texture for this ISO; above 1 less, none at 2. Below 1, amount() of that:
+    the rest of the photo is the one without noise reduction."""
     m = 1 + GRAIN_PER_STOP * np.log2(GRAIN_ISO / iso) if iso else 1
-    weights = [float(np.clip(m, GRAIN_FLOOR, 3)) * w for w in GRAIN]
-    if s <= 1:
-        return tuple(w + (1 - s) * max(1 - w, 0.0) for w in weights)
-    return tuple(w * max(2 - s, 0.0) for w in weights)
+    share = amount(s) if s <= 1 else max(2 - s, 0.0)
+    return tuple(float(np.clip(m, GRAIN_FLOOR, 3)) * w * share for w in GRAIN)
 
 
 def noise_samples(mosaic: np.ndarray, black: float, pattern: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -101,6 +105,13 @@ def chroma_eps(s: float) -> float:
     return CHROMA_EPS * max(1.0, s) ** 2
 
 
+def amount(s: float) -> float:
+    """How much of a photo is the standard result at strength `s`, the rest the photo without
+    noise reduction. Below 1 the noise left falls as (1 - s)^2: each step looks about as big
+    (noise halved looks far from half gone; mixed linearly, little changed below ~60%)."""
+    return 1 - (1 - min(s, 1.0)) ** 2
+
+
 def supported(raw) -> bool:
     return raw.raw_pattern is not None and np.asarray(raw.raw_pattern).shape == (2, 2)
 
@@ -120,9 +131,8 @@ def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float]
     typical noise at this ISO is known (`typical`, look.Profile.noise_at) and the photo
     measures more than CEILING times that, the typical noise is used instead.
 
-    Strength `s` (strength()): above 1, stronger averaging. Below 1 it's the same: a weaker
-    result gives more of the removed noise back as grain (grain_weights()), after
-    demosaicing; noise left in the mosaic would come out of AHD as dark worms at high ISO.
+    Strength `s` (strength()): above 1, stronger averaging. Below 1 it's the same, and the
+    result gets mixed with the photo without noise reduction (amount()).
 
     scale: raw units -> our normalised camera RGB (1 / (saturation - black))."""
     from . import gpu
