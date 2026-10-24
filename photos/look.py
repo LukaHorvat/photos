@@ -29,6 +29,7 @@ PROFILES = Path(__file__).parent / "profiles"
 TABLE_SIZE, TABLE_LEVELS = 33, 8
 CONTRAST_MAX = 0.45  # contrast curve strength at +-100; above 0.5 it would stop being monotonic
 WORK_SCALE = 4  # fitting a photo's tone happens at a quarter of its JPEG's size
+MIN_RISE = 0.15  # fit_curve: never flatter than this share of the standard curve's rise
 TONE_CHROMA = 0.45  # blocks more saturated than this (chromaticity distance from grey) don't set the tone curve
 
 # Without an embedded JPEG: one curve fitted to D3500 JPEGs, y = (1 + K) t^C / (t^C + K), t = G x.
@@ -265,22 +266,32 @@ def samples_at(raw: np.ndarray, t: Target, color, max_blocks: int = 20000, max_p
 
 
 def fit_curve(x: np.ndarray, y: np.ndarray) -> np.ndarray | None:
-    """Monotone curve y = f(x) sampled at 2^GRID: median per half-stop, smoothed."""
+    """Monotone curve y = f(x) sampled at 2^GRID: median per half-stop, smoothed.
+
+    Beyond the data it follows the standard curve's shape, slid in exposure to meet it (a dark
+    photo has data only in its shadows; a straight line from there climbed to white within a
+    few stops: DSC_0300). And it never goes flat, rising at least MIN_RISE of the standard
+    curve's (relative) rise per step: a flat stretch maps a range of tones to one, which shows
+    as flat patches once the shadows are lifted."""
     lx = np.log2(np.maximum(x, 2.0**-16))
     med = np.full(GRID.shape, np.nan)
     for i, g in enumerate(GRID):
         sel = (lx >= g - 0.25) & (lx < g + 0.25)
         if sel.sum() > 15:
             med[i] = np.median(y[sel])
-    ok = ~np.isnan(med)
+    ok = ~np.isnan(med) & (med > 0)
     if ok.sum() < 3:
         return None
+    standard = fallback_tone()
     curve = np.interp(GRID, GRID[ok], med[ok])
-    lo = GRID < GRID[ok][0]
-    curve[lo] = med[ok][0] * 2.0 ** (2.0 * (GRID[lo] - GRID[ok][0]))  # fade to black below the data
-    hi = GRID > GRID[ok][-1]
-    curve[hi] = np.minimum(1, med[ok][-1] + (GRID[hi] - GRID[ok][-1]) * 0.3)
-    curve = np.maximum.accumulate(curve)
+    for beyond, g0, y0 in ((GRID < GRID[ok][0], GRID[ok][0], med[ok][0]), (GRID > GRID[ok][-1], GRID[ok][-1], med[ok][-1])):
+        shift = np.log2(tone_inverse(standard, y0)) - g0
+        curve[beyond] = np.interp(GRID[beyond] + shift, GRID, standard)
+    log_curve = np.log(np.maximum(curve, 1e-9))
+    rise = MIN_RISE * np.diff(np.log(np.maximum(standard, 1e-12)))
+    for i in range(1, len(log_curve)):
+        log_curve[i] = max(log_curve[i], log_curve[i - 1] + rise[i - 1])
+    curve = np.minimum(np.exp(log_curve), 1)
     curve = np.convolve(np.pad(curve, 2, mode="edge"), np.ones(5) / 5, mode="valid")
     return curve + np.arange(curve.size) * 1e-7  # strictly increasing, so it can be inverted
 
