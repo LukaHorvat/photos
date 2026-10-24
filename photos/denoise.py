@@ -3,8 +3,9 @@
 1. Raw: non-local means on the four Bayer planes jointly (R, G1, G2, B as one 4-channel
    image, so every channel is averaged with the same weights and colours stay put), after a
    generalized Anscombe transform with this photo's measured noise (variance = A * signal
-   + B): the noise is ~1 everywhere, so one strength fits every brightness and ISO. On the
-   GPU; the result goes back into LibRaw's buffer and gets demosaiced as usual.
+   + B): the noise is ~1 everywhere, so one strength fits every brightness and ISO. The
+   weights come from there, the raw values are averaged (unbiased, see gpu.py). On the GPU;
+   the result goes back into LibRaw's buffer and gets demosaiced as usual.
 2. After demosaicing: colour noise smoothed by a guided filter that follows brightness
    edges (gpu.py), at half resolution like a JPEG's colour.
 3. Part of the removed luminance noise is given back, separately per scale, so the result
@@ -27,7 +28,8 @@ PATCH = 5  # NLM patch size
 GRAIN = (0.55, 0.4, 0.95)  # removed noise given back at GRAIN_ISO, fine, small, medium scale: the camera's texture
 GRAIN_ISO = 5000
 GRAIN_PER_STOP = 0.33  # the camera keeps more texture at lower ISOs: this much more grain per stop below GRAIN_ISO
-CHROMA_RADIUS = 3  # guided filter radius for colour, half-resolution pixels
+GRAIN_FLOOR = 0.65  # and above it less, down to this share of GRAIN, reached at ISO ~10000 (the camera's texture at 11400-25600)
+CHROMA_RADIUS = 3  # guided filter radius for colour, half-resolution pixels; larger bleeds skin colour into irises
 CHROMA_EPS = 0.004**2
 PHASES = ((0, 0), (0, 1), (1, 0), (1, 1))  # (row, column) of each Bayer plane within a 2x2 tile
 CEILING = 1.5  # a photo measuring noisier than this times the camera's typical noise at its ISO,
@@ -41,12 +43,18 @@ class Noise:
     grain: np.ndarray  # half-size scene luminance removed by NLM, oriented like the image
     as_shot: np.ndarray  # white balance and colour matrix the colour noise is judged in
     rgb_cam: np.ndarray
-    weights: tuple  # how much of the grain is given back per scale (grain_weights)
+    weights: tuple  # how much of the grain is given back per scale (grain_weights())
+    chroma_eps: float = CHROMA_EPS  # colour smoothing (chroma_eps())
 
 
-def grain_weights(iso: int | None) -> tuple:
+def grain_weights(iso: int | None, s: float = 1.0) -> tuple:
+    """How much of the removed noise is given back, per scale: at strength `s` 1 (strength())
+    the camera's texture for this ISO; below 1 more of it, all at 0; above 1 less, none at 2."""
     m = 1 + GRAIN_PER_STOP * np.log2(GRAIN_ISO / iso) if iso else 1
-    return tuple(float(np.clip(m, 0.5, 3)) * w for w in GRAIN)
+    weights = [float(np.clip(m, GRAIN_FLOOR, 3)) * w for w in GRAIN]
+    if s <= 1:
+        return tuple(w + (1 - s) * max(1 - w, 0.0) for w in weights)
+    return tuple(w * max(2 - s, 0.0) for w in weights)
 
 
 def noise_samples(mosaic: np.ndarray, black: float, pattern: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -80,18 +88,24 @@ def trusted(measured: tuple[float, float], typical: tuple[float, float], level: 
     return typical if variance(measured) > CEILING * variance(typical) else measured
 
 
-def active(setting: float | None, iso: int | None) -> bool:
-    """Whether a photo gets noise reduction: its setting (None: automatic, 0: off, 100: on)."""
+def strength(setting: float | None, iso: int | None) -> float:
+    """How strong a photo's noise reduction is, 1 standard, 0 none: its setting in percent, or
+    automatically, standard from AUTO_ISO up."""
     if setting is None:
-        return bool(iso) and iso >= AUTO_ISO
-    return setting > 0
+        return 1.0 if iso and iso >= AUTO_ISO else 0.0
+    return min(max(setting / 100, 0.0), 2.0)
+
+
+def chroma_eps(s: float) -> float:
+    """The colour guided filter's eps at strength `s`: stronger above 1."""
+    return CHROMA_EPS * max(1.0, s) ** 2
 
 
 def supported(raw) -> bool:
     return raw.raw_pattern is not None and np.asarray(raw.raw_pattern).shape == (2, 2)
 
 
-def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float] | None = None) -> tuple[np.ndarray, int]:
+def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float] | None = None, s: float = 1.0) -> tuple[np.ndarray, int]:
     """Denoise LibRaw's raw buffer in place (on the GPU).
 
     Returns the luminance removed, the grain's source (one value per 2x2 tile, scene units,
@@ -106,16 +120,20 @@ def raw_nlm(raw, black: float, scale: float, color, typical: tuple[float, float]
     typical noise at this ISO is known (`typical`, look.Profile.noise_at) and the photo
     measures more than CEILING times that, the typical noise is used instead.
 
+    Strength `s` (strength()): above 1, stronger averaging. Below 1 it's the same: a weaker
+    result gives more of the removed noise back as grain (grain_weights()), after
+    demosaicing; noise left in the mosaic would come out of AHD as dark worms at high ISO.
+
     scale: raw units -> our normalised camera RGB (1 / (saturation - black))."""
     from . import gpu
 
-    args = nlm_args(raw, black, scale, color, typical)
+    args = nlm_args(raw, black, scale, color, typical, s)
     denoised, removed = gpu.raw_nlm(raw.raw_image_visible, *args)
     raw.raw_image_visible[...] = denoised
     return removed, args[-1]
 
 
-def nlm_args(raw, black: float, scale: float, color, typical: tuple[float, float] | None = None) -> tuple:
+def nlm_args(raw, black: float, scale: float, color, typical: tuple[float, float] | None = None, s: float = 1.0) -> tuple:
     """raw_nlm()'s arguments for gpu.raw_nlm() after the mosaic (the gain last)."""
     mosaic = raw.raw_image_visible
     pattern = np.asarray(raw.raw_pattern)
@@ -126,7 +144,8 @@ def nlm_args(raw, black: float, scale: float, color, typical: tuple[float, float
     model = noise_model(mosaic, black, pattern)
     if typical:
         model = trusted(model, typical, CEILING_LEVEL * (raw.white_level - black))
-    return (black, *model, weights, STRENGTH, SEARCH, PATCH, gain)
+    greens = tuple(k for k, c in enumerate(colours) if c == 1)
+    return (black, *model, weights, STRENGTH * max(1.0, s), SEARCH, PATCH, greens, gain)
 
 
 def orient(img: np.ndarray, flip: int) -> np.ndarray:

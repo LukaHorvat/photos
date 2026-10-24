@@ -32,7 +32,8 @@ give the same result to the bit, ~10x faster than LibRaw runs it. A batch export
 ~0.5 s per photo.
 
 Unedited, a photo looks like the camera's own JPEG (`look.py`): its tone curve is
-fitted to the JPEG embedded in that raw (the camera adapts it per scene), and
+fitted to the JPEG embedded in that raw (the camera adapts it per scene; beyond the
+tones the photo has, it follows the camera's usual curve), and
 colour comes from a profile per camera model in `photos/profiles/`, fitted from
 raw + JPEG pairs:
 
@@ -44,8 +45,10 @@ Noise reduction works like the camera's (`denoise.py`): non-local means on the
 raw data before demosaicing; colour noise smoothed along brightness edges; then
 part of the removed grain given back, more at lower ISO, as the camera keeps it.
 It runs on the GPU, about 0.3 s per photo in a batch. Like the camera's, it's on
-from ISO 1000 (Auto); the editor's Noise reduction toggle overrides that per photo
-(and, like the sliders, for the rest of its series).
+from ISO 1000 (Auto); the editor's Noise reduction slider overrides that per photo (and,
+like the other sliders, for the rest of its series): 100% is the camera's, less gives
+more of the grain back, more smooths further (200%: no grain at all), 0 turns it off.
+It applies when you let go of the slider, as it needs the server to redo the photo.
 
 It needs to know how noisy the photo is. That's measured in the photo itself, but
 a photo full of fine texture (foliage) would read as very noisy and be smeared, so
@@ -83,7 +86,7 @@ Everything is saved as you go to `<folder>/.photos.json`:
 ```
 
 An edit sits on the photo where it starts to apply (`temp: null` means as shot,
-`noise: null` automatic, 0 off, 100 on).
+`noise: null` automatic, else its strength in percent: 0 off, 100 the camera's).
 
 ## Tests
 

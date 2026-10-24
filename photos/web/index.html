@@ -78,14 +78,10 @@
           <span class="sname">Saturation</span><span class="sval"></span>
           <input type="range" min="-100" max="100" step="1">
         </label>
-      </div>
-      <div id="nr" class="toggle">
-        <span class="sname">Noise reduction</span><span class="sval" id="nrval"></span>
-        <div class="seg">
-          <button class="chip" data-nr="auto" title="On from ISO 1000, like the camera's own JPEGs">Auto</button>
-          <button class="chip" data-nr="on">On</button>
-          <button class="chip" data-nr="off">Off</button>
-        </div>
+        <label class="slider" data-key="noise" title="Auto: the camera's strength (100%) from ISO 1000, off below, like its own JPEGs. Applies when you let go; double-click for Auto.">
+          <span class="sname">Noise reduction</span><span class="sval"></span>
+          <input type="range" min="0" max="200" step="5">
+        </label>
       </div>
       <p class="hint">Double-click a slider to reset it. <kbd>\</kbd> shows the photo without edits.
         <kbd>Ctrl</kbd> <kbd>C</kbd> / <kbd>V</kbd> copies and pastes settings.</p>

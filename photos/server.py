@@ -124,7 +124,7 @@ class Library:
         self.previews = Prefetcher(
             lambda key: develop.preview(self.photos[key[0]], read_file(self.photos[key[0]].path), key[1]), workers=4, keep=12
         )
-        # The export's input at full size, by (name, noise reduction on), for the editor's final
+        # The export's input at full size, by (name, noise reduction strength), for the editor's final
         # views: ~200 MB and 0.6-2 s of work each, for the photo on screen and the next (which
         # waits for it). Two at a time, so a change to the photo on screen needn't wait for the next.
         self.fulls = Prefetcher(
@@ -235,7 +235,7 @@ class Library:
             setting = self.settings()[name]["noise"]
         else:
             setting = None if noise == "auto" else float(noise)
-        return name, denoise.active(setting, self.photos[name].iso)
+        return name, denoise.strength(setting, self.photos[name].iso)
 
     def runs(self) -> dict:
         """What the editor shows: which photos share settings, and those settings."""

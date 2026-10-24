@@ -100,13 +100,18 @@ function formatValue(key, v) {
     const t = v ?? asShotTemp();
     return v == null ? (t ? `${t} K, as shot` : 'as shot') : `${v} K`;
   }
+  if (key === 'noise') {
+    if (v != null) return v ? `${v}%` : 'Off';
+    const name = editCurrent();
+    const iso = name && metas.get(name)?.iso;
+    return `Auto: ${nrExpected(name, null) ? '100%' : 'off'}${iso ? ` at ISO ${iso}` : ''}`;
+  }
   return String(v);
 }
 
-// Noise reduction: null automatic (the server decides by ISO), 0 off, 100 on.
-const NR_SETTING = { auto: null, on: 100, off: 0 };
-const nrName = (setting) => (setting == null ? 'auto' : setting > 0 ? 'on' : 'off');
-const finalKey = (name, setting) => `${name}|${nrName(setting)}`;
+// Noise reduction: null automatic (the server decides by ISO), else its strength in % of
+// the camera's, 0 off. It changes the data the server sends, so it applies on release.
+const finalKey = (name, setting) => `${name}|${setting ?? 'auto'}`;
 const currentKey = () => editCurrent() && finalKey(editCurrent(), ED.live?.noise);
 
 function nrExpected(name, setting) {
@@ -117,20 +122,6 @@ function nrExpected(name, setting) {
   if (shown) return shown.grain;
   const iso = metas.get(name)?.iso;
   return !!iso && iso >= ED.autoNoiseIso;
-}
-
-function updateNoise() {
-  const name = editCurrent();
-  const setting = ED.live?.noise ?? null;
-  for (const b of document.querySelectorAll('#nr button')) b.classList.toggle('on', !!ED.live && b.dataset.nr === nrName(setting));
-  const label = $('#nrval');
-  const iso = name && metas.get(name)?.iso;
-  label.textContent = !ED.live || setting != null ? '' : `${nrExpected(name, null) ? 'on' : 'off'}${iso ? ` at ISO ${iso}` : ''}`;
-  label.classList.add('default');
-}
-
-for (const b of document.querySelectorAll('#nr button')) {
-  b.addEventListener('click', () => { if (ED.live) setSettings({ ...ED.live, noise: NR_SETTING[b.dataset.nr] }); });
 }
 
 function setSettings(settings) {
@@ -149,7 +140,6 @@ function setSettings(settings) {
 }
 
 function updateSliders() {
-  updateNoise();
   for (const el of SLIDERS) {
     const key = el.dataset.key;
     const input = el.querySelector('input');
@@ -157,6 +147,8 @@ function updateSliders() {
     if (key === 'temp') {
       const t = v ?? asShotTemp();
       input.value = t ? tempToSlider(t) : 500;
+    } else if (key === 'noise') {
+      input.value = v ?? (nrExpected(editCurrent(), null) ? 100 : 0);
     } else {
       input.value = v;
     }
@@ -172,12 +164,21 @@ for (const el of SLIDERS) {
   input.addEventListener('input', () => {
     if (!ED.live) return;
     const v = Number(input.value);
+    if (key === 'noise') { // only the label until release
+      const label = el.querySelector('.sval');
+      label.textContent = formatValue(key, v);
+      label.classList.remove('default');
+      return;
+    }
     ED.live = { ...ED.live, [key]: key === 'temp' ? sliderToTemp(v) : v };
     ED.before = false;
     updateSliders();
     requestDraw();
   });
-  input.addEventListener('change', commit);
+  input.addEventListener('change', () => {
+    if (key !== 'noise') commit();
+    else if (ED.live) setSettings({ ...ED.live, noise: Number(input.value) });
+  });
   // Hand the arrow keys back to photo navigation once the mouse lets go.
   input.addEventListener('pointerup', () => setTimeout(() => input.blur(), 0));
   el.addEventListener('dblclick', () => { if (ED.live) setSettings({ ...ED.live, [key]: ED.defaults[key] }); });
@@ -272,13 +273,15 @@ function requestDraw() {
     });
   }
   const loading = ED.view && visibleTiles().some((t) => !t.loaded);
-  const finishing = ED.shownKey !== currentKey() && nrExpected(editCurrent(), ED.live?.noise);
+  // Waiting for final data: with noise reduction, or after its setting changed (to off).
+  const reducing = nrExpected(editCurrent(), ED.live?.noise);
+  const finishing = ED.shownKey !== currentKey() && (reducing || ED.shownKey !== `${editCurrent()}|quick`);
   $('#editnote').textContent = ED.picking
     ? PICK_HINT[ED.picking]
     : ED.before ? 'Before'
     : ED.shown !== editCurrent() ? 'Developing…'
     : loading ? 'Loading full size…'
-    : finishing ? 'Reducing noise…' : '';
+    : finishing ? (reducing ? 'Reducing noise…' : 'Developing…') : '';
 }
 
 function layoutEdit() {

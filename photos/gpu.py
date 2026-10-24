@@ -24,6 +24,7 @@ import numpy as np
 
 WEB = Path(__file__).parent / "web"
 POOL_IDLE = 300  # seconds without GPU work, after which the texture pool (~1 GB) is freed; remaking it costs ~0.5 s
+GREENS_FLAT = (0.5, 1.5)  # raw_out: brightness steps (noise sd) up to which a tile's two greens are evened out, fully to partly
 _thread = ThreadPoolExecutor(1, thread_name_prefix="gpu")
 _gl: dict = {}
 # Free textures by (size, components, dtype), for reuse: new GPU memory is slow (on WSL
@@ -128,15 +129,17 @@ def _f32(a) -> np.ndarray:
     return np.ascontiguousarray(a, np.float32)
 
 
-def raw_nlm(mosaic: np.ndarray, black: float, A: float, B: float, weights, h: float, search: int, patch: int, gain: int = 1):
+def raw_nlm(mosaic: np.ndarray, black: float, A: float, B: float, weights, h: float, search: int, patch: int,
+            greens: tuple[int, int] | None = None, gain: int = 1):
     """Non-local means on a Bayer mosaic (uint16, 2x2 pattern): its four planes as one
     4-channel image, so every colour gets the same weights, after a generalized Anscombe
     transform for noise variance A * signal + B (black subtracted), which makes the noise ~1.
 
     Returns the denoised mosaic, times `gain` (uint16: what denoising adds below one raw unit
     survives), and per 2x2 tile, sum(weights * removed) over the four photosites (float32,
-    half size)."""
-    out, removed = _run(_raw_nlm, np.ascontiguousarray(mosaic, np.uint16), black, A, B, weights, h, search, patch, gain)
+    half size). `greens`: where a tile's two green photosites are (denoise.PHASES order), to
+    even them out where the photo is flat (see raw_out)."""
+    out, removed = _run(_raw_nlm, np.ascontiguousarray(mosaic, np.uint16), black, A, B, weights, h, search, patch, greens, gain)
     hh, ww = mosaic.shape[0] // 2, mosaic.shape[1] // 2
     return np.frombuffer(out, np.uint16).reshape(mosaic.shape), np.frombuffer(removed, np.float32).reshape(hh, ww)
 
@@ -247,47 +250,74 @@ PASS_HEADER = """#version 330
 #define TENT(i) (max(vec3(3.0, 5.0, 9.0) - abs(float(i)), 0.0) / vec3(9.0, 25.0, 81.0))
 """
 
-# The raw mosaic, a 2x2 tile at a time (photosites in denoise.PHASES order), and the
-# variance-stabilising transform.
-RAW = """
-    uniform usampler2D raw; uniform float black, A, c;
+# The variance-stabilising transform: noise of variance A x + B (raw units above black) becomes
+# ~1 everywhere. c = 3/8 A^2 + B.
+VST = """
+    uniform float A, c;
+    vec4 forward(vec4 x) { return 2.0 / A * sqrt(max(A * x + c, 0.0)); }
+    vec4 inverse(vec4 z) { return ((z * A / 2.0) * (z * A / 2.0) - c) / A; }
+"""
+# The raw mosaic, a 2x2 tile at a time (photosites in denoise.PHASES order), and the NLM's
+# result for a tile (raw units above black).
+RAW = VST + """
+    uniform usampler2D raw; uniform float black;
     vec4 tile(ivec2 t) {
       ivec2 q = 2 * t;
       return vec4(texelFetch(raw, q, 0).r, texelFetch(raw, q + ivec2(1, 0), 0).r,
                   texelFetch(raw, q + ivec2(0, 1), 0).r, texelFetch(raw, q + ivec2(1, 1), 0).r) - black;
     }
-    vec4 forward(vec4 x) { return 2.0 / A * sqrt(max(A * x + c, 0.0)); }
-    vec4 inverse(vec4 z) { return ((z * A / 2.0) * (z * A / 2.0) - c) / A; }
+    uniform sampler2D sum; uniform sampler2D weight;
+    vec4 denoised(ivec2 t) { return texelFetch(sum, t, 0) / texelFetch(weight, t, 0).r; }
 """
 
 SHADERS = {
     "raw_planes": RAW + """
         out vec4 z;
         void main() { z = forward(tile(ivec2(gl_FragCoord.xy))); }""",
-    # The denoised mosaic: the NLM result (sum / weight) back in raw units.
+    # The denoised mosaic: the NLM result (sum / weight). Each plane is averaged on its own,
+    # so the two greens of a tile keep different leftover noise, varying smoothly; AHD turns
+    # that into a maze of short lines. Where the photo is flat (between the next tiles,
+    # brightness changes by less than GREENS_FLAT noise sd), the two greens get their mean;
+    # at edges they differ for real (a pixel apart) and stay.
     "raw_out": RAW + """
-        uniform sampler2D sum; uniform sampler2D weight; uniform float gain;
+        uniform float gain;
+        uniform ivec2 greens;  // the tile's two green photosites, or -1: leave them
+        uniform vec2 flatness;  // GREENS_FLAT
         out uint v;
+        float lum(ivec2 t) { return dot(denoised(clamp(t, ivec2(0), textureSize(sum, 0) - 1)), vec4(1.0)); }
         void main() {
           ivec2 p = ivec2(gl_FragCoord.xy), t = p / 2;
           float x = float(texelFetch(raw, p, 0).r);  // odd size: no whole tile here
-          if (all(lessThan(t, textureSize(sum, 0))))
-            x = inverse(texelFetch(sum, t, 0) / texelFetch(weight, t, 0).r)[(p.y & 1) * 2 + (p.x & 1)] + black;
+          if (all(lessThan(t, textureSize(sum, 0)))) {
+            vec4 d = denoised(t);
+            if (greens.x >= 0) {
+              float l = lum(t - ivec2(1, 0)), r = lum(t + ivec2(1, 0)), u = lum(t - ivec2(0, 1)), b = lum(t + ivec2(0, 1));
+              float sd = sqrt(2.0 * (A * max((l + r + u + b) / 4.0, 0.0) + 4.0 * (c - 0.375 * A * A)));  // of a difference of two tiles' sums
+              float even = (1.0 - smoothstep(flatness.x, flatness.y, max(abs(r - l), abs(b - u)) / sd)) * (d[greens.x] - d[greens.y]) / 2.0;
+              d[greens.x] -= even;
+              d[greens.y] += even;
+            }
+            x = d[(p.y & 1) * 2 + (p.x & 1)] + black;
+          }
           v = uint(clamp(round(x * gain), 0.0, 65535.0));
         }""",
     "raw_removed": RAW + """
-        uniform sampler2D sum; uniform sampler2D weight; uniform vec4 weights;
+        uniform vec4 weights;
         out float v;
         void main() {
           ivec2 t = ivec2(gl_FragCoord.xy);
-          v = dot(weights, tile(t) - inverse(texelFetch(sum, t, 0) / texelFetch(weight, t, 0).r));
+          v = dot(weights, tile(t) - denoised(t));
         }""",
     # Non-local means, four search offsets per pass. Each offset o is done once for both
-    # pairs it stands for, (p, p + o) and (p - o, p): the patch distance is the same.
-    "nlm_init": """
+    # pairs it stands for, (p, p + o) and (p - o, p): the patch distance is the same. The
+    # weights come from patch distances in the stabilised domain, where noise is even, but
+    # what's averaged is the values back in raw units: an average taken in the stabilised
+    # domain reads low once back (the square root is concave), by about A / 4; at ISO 25600
+    # ~9 raw units, half the blue of a black dress.
+    "nlm_init": VST + """
         uniform sampler2D img;
         layout(location = 0) out vec4 sum; layout(location = 1) out float weight;
-        void main() { sum = texelFetch(img, ivec2(gl_FragCoord.xy), 0); weight = 1.0; }""",
+        void main() { sum = inverse(texelFetch(img, ivec2(gl_FragCoord.xy), 0)); weight = 1.0; }""",
     # Squared differences to the four offsets, summed along the patch's rows (its columns
     # are summed by a box pass).
     "nlm_diff": """
@@ -306,7 +336,7 @@ SHADERS = {
             d += vec4(dot(d0, d0), dot(d1, d1), dot(d2, d2), dot(d3, d3));
           }
         }""",
-    "nlm_acc": """
+    "nlm_acc": VST + """
         uniform sampler2D dist; uniform sampler2D img; uniform ivec2 o0, o1, o2, o3; uniform float inv_n, inv_h2;
         layout(location = 0) out vec4 sum; layout(location = 1) out float weight;
         float wt(float s) { return exp(-max(s * inv_n - 2.0, 0.0) * inv_h2); }
@@ -321,7 +351,7 @@ SHADERS = {
             ivec2 q = p - o[k];
             bool inside = q.x >= 0 && q.y >= 0 && q.x <= last.x && q.y <= last.y;
             float wb = inside ? wt(texelFetch(dist, q, 0)[k]) : 0.0;
-            sum += wf * texelFetch(img, clamp(p + o[k], ivec2(0), last), 0) + wb * texelFetch(img, clamp(q, ivec2(0), last), 0);
+            sum += wf * inverse(texelFetch(img, clamp(p + o[k], ivec2(0), last), 0)) + wb * inverse(texelFetch(img, clamp(q, ivec2(0), last), 0));
             weight += wf + wb;
           }
         }""",
@@ -819,7 +849,7 @@ def _raw_nlm(mosaic, *args):
         _release(raw, out, removed)
 
 
-def _nlm(raw, size, black, A, B, weights, h, search, patch, gain):
+def _nlm(raw, size, black, A, B, weights, h, search, patch, greens, gain):
     """raw_nlm() of the mosaic in texture `raw`: the denoised mosaic (R16UI) and what was
     removed (R32F, half size), as textures to hand back with _release."""
     import moderngl
@@ -830,10 +860,10 @@ def _nlm(raw, size, black, A, B, weights, h, search, patch, gain):
     d, dist = (_texture(half, 4, dtype="f2") for _ in range(2))  # half floats: 25% faster, differences < 0.01 noise sd
     wgt, out, removed = _texture(half, 1), _texture(size, 1, dtype="u2"), _texture(half, 1)
     fbs = {k: ctx.framebuffer(t) for k, t in [("z", [z]), ("acc", [acc, wgt]), ("d", [d]), ("dist", [dist]), ("out", [out]), ("removed", [removed])]}
-    common = dict(black=float(black), A=A, c=3 / 8 * A * A + B)
+    vst = dict(A=A, c=3 / 8 * A * A + B)
     try:
-        _pass("raw_planes", fbs["z"], {"raw": raw}, **common)
-        _pass("nlm_init", fbs["acc"], {"img": z})
+        _pass("raw_planes", fbs["z"], {"raw": raw}, black=float(black), **vst)
+        _pass("nlm_init", fbs["acc"], {"img": z}, **vst)
         r, R = patch // 2, search // 2
         offsets = [(dx, dy) for dy in range(R + 1) for dx in range(-R, R + 1) if dy > 0 or dx > 0]
         offsets += [(0, 0)] * (-len(offsets) % 4)
@@ -845,10 +875,11 @@ def _nlm(raw, size, black, A, B, weights, h, search, patch, gain):
             _pass("box", fbs["dist"], {"src": d}, r=r, dir=(0, 1), scale=1.0)
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = moderngl.ONE, moderngl.ONE
-            _pass("nlm_acc", fbs["acc"], {"dist": dist, "img": z}, inv_n=inv_n, inv_h2=1 / (h * h), **o)
+            _pass("nlm_acc", fbs["acc"], {"dist": dist, "img": z}, inv_n=inv_n, inv_h2=1 / (h * h), **vst, **o)
         ctx.disable(moderngl.BLEND)
-        _pass("raw_out", fbs["out"], {"raw": raw, "sum": acc, "weight": wgt}, gain=float(gain), **common)
-        _pass("raw_removed", fbs["removed"], {"raw": raw, "sum": acc, "weight": wgt}, weights=tuple(weights), **common)
+        _pass("raw_out", fbs["out"], {"raw": raw, "sum": acc, "weight": wgt}, gain=float(gain), black=float(black),
+              greens=greens or (-1, -1), flatness=GREENS_FLAT, **vst)
+        _pass("raw_removed", fbs["removed"], {"raw": raw, "sum": acc, "weight": wgt}, weights=tuple(weights), black=float(black))
         return out, removed
     except BaseException:
         _release(out, removed)
@@ -934,8 +965,8 @@ def _resize(shader: str, source: dict, in_size, size, box, components: int, **un
         _release(bx, by, small, fb)
 
 
-def _chroma_nr(cam, size, mul, rgb_cam):
-    """Camera RGB with colour noise smoothed (RGBA16F texture)."""
+def _chroma_nr(cam, size, mul, rgb_cam, eps):
+    """Camera RGB with colour noise smoothed (RGBA16F texture); eps: denoise.chroma_eps()."""
     import moderngl
 
     from . import denoise
@@ -957,7 +988,7 @@ def _chroma_nr(cam, size, mul, rgb_cam):
         for _ in range(2):
             _box(t0, tmp, m0, denoise.CHROMA_RADIUS)
             _box(t1, tmp, m1, denoise.CHROMA_RADIUS)
-            _pass("chroma_coef", fb(coef), {"m0": m0, "m1": m1}, eps=denoise.CHROMA_EPS)
+            _pass("chroma_coef", fb(coef), {"m0": m0, "m1": m1}, eps=eps)
             _box(coef, tmp, mc, denoise.CHROMA_RADIUS)
             _pass("chroma_apply", fb(t0, t1), {"t0in": t0, "mc": mc})
         t0.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -984,7 +1015,7 @@ def _grain(removed, weights, size):
 
 def _with_noise(cam, noise, removed, size) -> tuple:
     """The develop shader's camera RGB and grain textures, from the camera RGB texture."""
-    smoothed = _chroma_nr(cam, size, noise.as_shot.astype(np.float32), noise.rgb_cam)
+    smoothed = _chroma_nr(cam, size, noise.as_shot.astype(np.float32), noise.rgb_cam, noise.chroma_eps)
     return smoothed, _grain(removed, noise.weights, size)
 
 

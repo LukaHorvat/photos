@@ -28,8 +28,10 @@ def noisy_mosaic(shape, A, B, seed=0):
     return np.clip(np.round(noisy + BLACK), 0, 65535).astype(np.uint16), signal
 
 
-def reference_nlm(z, h, search, patch):
-    """Textbook non-local means (correct away from the borders, where np.roll doesn't wrap)."""
+def reference_nlm(z, h, search, patch, values=None):
+    """Textbook non-local means (correct away from the borders, where np.roll doesn't wrap): the
+    weights from z, averaging `values` (z itself if not given)."""
+    values = z if values is None else values
     R, r = search // 2, patch // 2
     num, den = np.zeros_like(z), np.zeros(z.shape[:2] + (1,))
     for dy in range(-R, R + 1):
@@ -38,7 +40,7 @@ def reference_nlm(z, h, search, patch):
             sq = ((z - other) ** 2).sum(-1)
             dist = sum(np.roll(sq, (-iy, -ix), (0, 1)) for iy in range(-r, r + 1) for ix in range(-r, r + 1))
             w = np.exp(-np.maximum(dist / ((2 * r + 1) ** 2 * z.shape[-1]) - 2, 0) / h**2)[..., None]
-            num += w * other
+            num += w * np.roll(values, (-dy, -dx), (0, 1))
             den += w
     return num / den
 
@@ -61,7 +63,7 @@ def test_raw_nlm_is_non_local_means_in_the_stabilised_domain(gpu):
     c = 3 / 8 * A * A + B
     planes = np.stack([mosaic[dy::2, dx::2].astype(np.float64) - BLACK for dy, dx in denoise.PHASES], -1)
     z = 2 / A * np.sqrt(A * planes + c)
-    expected = ((reference_nlm(z, h, search, patch) * A / 2) ** 2 - c) / A
+    expected = reference_nlm(z, h, search, patch, values=((z * A / 2) ** 2 - c) / A)  # raw values averaged: see gpu.py
     got = np.stack([out[dy::2, dx::2].astype(np.float64) - BLACK for dy, dx in denoise.PHASES], -1)
     inner = np.s_[search // 2 + patch // 2 : -(search // 2 + patch // 2)]
     assert np.abs(got[inner, inner] - expected[inner, inner]).max() <= 1.5  # rounding to raw units, half-float distances
@@ -75,6 +77,32 @@ def test_raw_nlm_is_non_local_means_in_the_stabilised_domain(gpu):
     fine = np.stack([out_fine[dy::2, dx::2].astype(np.float64) / gain - BLACK for dy, dx in denoise.PHASES], -1)
     assert np.abs(fine - got).max() <= 0.5 + 0.5 / gain
     assert np.abs(fine[inner, inner] - expected[inner, inner]).max() < np.abs(got[inner, inner] - expected[inner, inner]).max()
+
+
+def test_raw_nlm_keeps_the_level_in_the_dark(gpu):
+    # ISO 25600's noise: the plain inverse transform left these 9 raw units darker
+    A, B, gain = 36.0, 4700.0, 16
+    rng = np.random.default_rng(3)
+    for level in (0, 20, 50, 400):
+        mosaic = np.round(BLACK + level + rng.normal(0, np.sqrt(A * level + B), (192, 192))).astype(np.uint16)
+        out, _ = gpu.raw_nlm(mosaic, BLACK, A, B, [0.25] * 4, denoise.STRENGTH, denoise.SEARCH, denoise.PATCH, gain=gain)
+        assert out.astype(float).mean() / gain - BLACK == pytest.approx(level, abs=1.5)
+
+
+def test_raw_nlm_evens_out_the_greens_where_flat(gpu):
+    A, B, gain = 2.0, 60.0, 16
+    signal = np.full((128, 192), 500.0)
+    signal[:, 97:] += 2000  # a step between the two columns of tile column 48
+    rng = np.random.default_rng(4)
+    mosaic = np.round(BLACK + signal + rng.normal(0, 1, signal.shape) * np.sqrt(A * signal + B)).astype(np.uint16)
+    args = (BLACK, A, B, [0.25] * 4, denoise.STRENGTH, denoise.SEARCH, denoise.PATCH)
+    evened, _ = gpu.raw_nlm(mosaic, *args, greens=(1, 2), gain=gain)  # R G / G B
+    plain, _ = gpu.raw_nlm(mosaic, *args, gain=gain)
+    diff = lambda out: (out[0::2, 1::2].astype(float) - out[1::2, 0::2]) / gain  # G1 - G2, per tile
+    flat = np.s_[4:-4, 4:40]
+    assert diff(plain)[flat].std() > 1 and np.abs(diff(evened)[flat]).max() <= 1 / gain
+    assert diff(evened)[4:-4, 48].mean() == pytest.approx(2000, abs=50)  # the step: G1 is right of it, G2 left
+    assert np.array_equal(diff(evened)[:, 48], diff(plain)[:, 48])
 
 
 def test_grain_follows_iso():
@@ -109,14 +137,30 @@ def test_texture_doesnt_pass_for_noise():
 
 
 def test_automatic_noise_reduction_follows_iso():
-    assert not denoise.active(None, 200) and denoise.active(None, denoise.AUTO_ISO) and denoise.active(None, 6400)
-    assert not denoise.active(None, None)  # no ISO to judge by
-    assert denoise.active(100, 200) and not denoise.active(0, 6400)  # the photo's setting wins
+    assert denoise.strength(None, 200) == 0 and denoise.strength(None, denoise.AUTO_ISO) == denoise.strength(None, 6400) == 1
+    assert denoise.strength(None, None) == 0  # no ISO to judge by
+    assert denoise.strength(100, 200) == 1 and denoise.strength(0, 6400) == 0  # the photo's setting wins
 
 
 def test_noise_setting_is_automatic_unless_set():
     assert develop.clean({})["noise"] is None and develop.clean({"noise": None})["noise"] is None
-    assert develop.clean({"noise": 100})["noise"] == 100 and develop.clean({"noise": 250})["noise"] == 100
+    assert develop.clean({"noise": 100})["noise"] == 100 and develop.clean({"noise": 250})["noise"] == 200
+
+
+def test_strength_and_colour_smoothing():
+    assert denoise.strength(60, 25600) == 0.6 and denoise.strength(150, 200) == 1.5 and denoise.strength(0, 6400) == 0
+    assert denoise.chroma_eps(0.5) == denoise.chroma_eps(1) == denoise.CHROMA_EPS and denoise.chroma_eps(2) == 4 * denoise.CHROMA_EPS
+
+
+def test_strength_sets_how_much_grain_is_given_back():
+    for iso in (1000, 6400, 25600):
+        standard = denoise.grain_weights(iso)
+        assert denoise.grain_weights(iso, 1) == standard
+        weaker = denoise.grain_weights(iso, 0.5)
+        assert all(w > s if s < 1 else w == s for w, s in zip(weaker, standard))  # more back, unless that was all already
+        assert denoise.grain_weights(iso, 0) == pytest.approx(tuple(max(w, 1) for w in standard))  # all of it
+        assert denoise.grain_weights(iso, 1.5) == pytest.approx(tuple(w / 2 for w in standard))  # stronger: less
+        assert denoise.grain_weights(iso, 2) == (0, 0, 0)
 
 
 def test_camera_noise_profile_round_trip(tmp_path):
