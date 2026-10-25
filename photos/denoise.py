@@ -199,17 +199,6 @@ def luminance_weights(pattern, color, scale: float) -> list[float]:
     return [float(lum[c] / colours.count(c)) for c in colours]  # the two greens are averaged
 
 
-def removed(mosaic: np.ndarray, rgb: np.ndarray, pattern, weights) -> np.ndarray:
-    """What demosaicing and denoising to camera RGB `rgb` (H x W x 3) took out of `mosaic` (H x W,
-    the same units), per 2x2 tile: sum(weights * removed) over its photosites (half size, float32),
-    the grain's source like raw_nlm()'s."""
-    out = np.zeros((mosaic.shape[0] // 2, mosaic.shape[1] // 2), np.float32)
-    for (dy, dx), c, w in zip(PHASES, _colours(pattern), weights):
-        site = np.s_[dy : 2 * out.shape[0] : 2, dx : 2 * out.shape[1] : 2]
-        out += np.float32(w) * (mosaic[site] - rgb[site + (c,)])
-    return out
-
-
 def orient(img: np.ndarray, flip: int) -> np.ndarray:
     """Turn an image as stored on the sensor like LibRaw turns the developed one."""
     return {0: img, 3: img[::-1, ::-1], 5: np.rot90(img, 1), 6: np.rot90(img, -1)}.get(flip, img)

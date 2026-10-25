@@ -37,16 +37,16 @@ _latest = 0
 @dataclass
 class Decoded:
     """Camera RGB on the GPU, as the develop shader's input (an RGBA16F texture, oriented,
-    black 0, sensor saturation 1), until release(): from demosaic(), or upload(). With what
-    the CPU needs of it, averaged down and read back by demosaic()."""
+    black 0, sensor saturation 1), until release(): from demosaic(), neural() or upload(). With
+    what the CPU needs of it, averaged down and read back by demosaic() and neural()."""
 
     width: int
     height: int
     cam: object  # the texture: for the GL thread only
-    look: np.ndarray | None = None  # demosaic(look=...)
-    base: np.ndarray | None = None  # demosaic(base=...)
-    removed: np.ndarray | None = None  # demosaic(nlm=...): what raw_nlm() returns as removed
-    original: object = None  # demosaic(original=True), upload(original=...): camera RGB without noise reduction
+    look: np.ndarray | None = None  # demosaic(look=...), neural(look=...)
+    base: np.ndarray | None = None  # demosaic(base=...), neural(base=...)
+    removed: np.ndarray | None = None  # demosaic(nlm=...): what raw_nlm() returns as removed; neural()'s
+    original: object = None  # demosaic(original=True), neural(original=...), upload(original=...): camera RGB without noise reduction
 
     def release(self):
         textures = [t for t in (self.cam, self.original) if t is not None]
@@ -81,20 +81,45 @@ def demosaic(mosaic, pattern, black: int, saturation: int, flip: int, cam_xyz, t
     return _run(_demosaic, mosaic, np.asarray(pattern), int(black), int(saturation), int(flip), xyz, to_cam, nlm, look, base, original)
 
 
-def upload(rgb, original=None, look=None, base=None) -> Decoded:
-    """Camera RGB (HxWx3 float32) as a Decoded, for what LibRaw or RawNIND (neural.py)
-    demosaics. original: the same without noise reduction, if it is to be mixed in
-    (Decoded.original): an array, or a Decoded whose camera RGB this takes over. look, base: as
-    demosaic() averages them down, from the camera RGB as uploaded (float16)."""
+def upload(rgb, original=None) -> Decoded:
+    """Camera RGB (HxWx3 float32) as a Decoded, for what LibRaw demosaics. original: the same
+    without noise reduction, if it is to be mixed in (Decoded.original)."""
     h, w = rgb.shape[:2]
-    if base is not None:
-        mul, weights, size = base
-        base = (tuple(np.float32(mul).tolist()), tuple(np.float32(weights).tolist()), size)
-    decoded = Decoded(w, h, *_run(_upload_decoded, _rgba16(rgb), look, base))
-    if isinstance(original, Decoded):
-        decoded.original, original.cam = original.cam, None
-    elif original is not None:
+    decoded = Decoded(w, h, _run(_upload, _rgba16(rgb)))
+    if original is not None:
         decoded.original = _run(_upload, _rgba16(original))
+    return decoded
+
+
+def neural(mosaic, pattern, black: int, saturation: int, flip: int, denoise, weights, original=None, look=None, base=None) -> Decoded:
+    """Camera RGB from RawNIND (neural.py) as a Decoded, oriented, black 0 and saturation 1 as
+    demosaic() makes it. denoise(blend) runs it (neural.denoise() but for `blend`) over this
+    mosaic (uint16, its 2x2 pattern as LibRaw numbers it), its tiles blended here, and returns
+    the gain to apply. The camera RGB is rounded to float16 as numpy rounds.
+
+    Decoded.removed: what it took out of the mosaic, per 2x2 tile sum(weights * removed) over
+    its photosites (denoise.PHASES order; half size, float32), the grain's source like
+    raw_nlm()'s. original: a Decoded whose camera RGB this takes over (Decoded.original), the
+    photo without noise reduction. look, base: as demosaic() averages them down, from the
+    camera RGB as rounded."""
+    from .denoise import PHASES
+
+    mosaic = np.ascontiguousarray(mosaic, np.uint16)
+    h, w = mosaic.shape
+    out = (h, w) if flip & 4 else (w, h)
+    colours = tuple(1 if pattern[p] == 3 else int(pattern[p]) for p in PHASES)  # the second green is green
+    if base is not None:
+        mul, base_weights, size = base
+        base = (tuple(np.float32(mul).tolist()), tuple(np.float32(base_weights).tolist()), size)
+    blending = _run(_neural_start, mosaic)
+    try:
+        gain = denoise(lambda y, x, tile, wy, wx: _run(_neural_blend, blending, int(y), int(x), _f32(tile), _f32(wy), _f32(wx)))
+        cam, small, lum, removed = _run(_neural_finish, blending, tuple(np.float32(gain).tolist()), black, saturation, flip, out, colours, tuple(weights), look, base)
+    finally:
+        _run(_release, *blending.values())
+    decoded = Decoded(out[0], out[1], cam, look=small, base=lum, removed=removed)
+    if original is not None:
+        decoded.original, original.cam = original.cam, None
     return decoded
 
 
@@ -511,17 +536,20 @@ ROUND = """
     float r(float x) { return uintBitsToFloat(floatBitsToUint(x) ^ zero); }
     vec3 r(vec3 x) { return uintBitsToFloat(floatBitsToUint(x) ^ zero); }
 """
-# LibRaw's output as develop._decode turns it into camera RGB, in float32 as numpy does it: a
-# multiply, then a subtraction. toHalf: rounded to the nearest half float as numpy rounds, for
-# an RGBA16F texture (D3D12 truncates float32 to float16): to its step at that exponent, ties to even.
-CAMERA = ROUND + """
-    uniform vec2 toCam;
-    vec3 camera(ivec3 v) { return r(r(vec3(v) * toCam.x) - toCam.y); }
+# Rounded to the nearest half float as numpy rounds, for an RGBA16F texture (D3D12 truncates
+# float32 to float16): to its step at that exponent, ties to even.
+HALF = """
     vec3 toHalf(vec3 x) {
       ivec3 e = ivec3((floatBitsToUint(x) >> 23) & 255u) - 127;
       vec3 step = exp2(vec3(max(e, -14) - 10));
       return roundEven(x / step) * step;
     }
+"""
+# LibRaw's output as develop._decode turns it into camera RGB, in float32 as numpy does it: a
+# multiply, then a subtraction.
+CAMERA = ROUND + HALF + """
+    uniform vec2 toCam;
+    vec3 camera(ivec3 v) { return r(r(vec3(v) * toCam.x) - toCam.y); }
 """
 TO_CAM = CAMERA + """
     uniform usampler2D rgb;  // LibRaw's output (ahd_combine), oriented
@@ -535,7 +563,7 @@ BOX = """
     ivec2 boxY() { return texelFetch(boundsY, ivec2(int(gl_FragCoord.y), 0), 0).xy; }
 """
 FLOAT_CAM = """
-    uniform sampler2D src;  // camera RGB as uploaded (upload())
+    uniform sampler2D src;  // camera RGB in a float texture (neural())
     vec3 camAt(ivec2 p) { return texelFetch(src, p, 0).rgb; }
 """
 # The base layer's luminance, averaged down: min(rgb * mul, min(mul)) . weights
@@ -677,6 +705,43 @@ SHADERS.update({
         }""",
     "box_luminance": TO_CAM + BOX + LUMINANCE,
     "box_texture_luminance": FLOAT_CAM + BOX + LUMINANCE,
+    # RawNIND's tiles (neural.py), blended (added up) as the sensor has them, then turned like
+    # ahd_combine, scaled and rounded as camera RGB; and what that took out of the mosaic.
+    "neural_blend": """
+        uniform sampler2D tile;    // the model's output: its R, G and B planes, one above the other
+        uniform sampler2D wy, wx;  // its weights along rows and columns
+        uniform ivec2 origin;      // where its top left is in the photo
+        out vec4 v;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy) - origin, n = ivec2(0, textureSize(tile, 0).y / 3);
+          float w = texelFetch(wy, ivec2(p.y, 0), 0).r * texelFetch(wx, ivec2(p.x, 0), 0).r;
+          v = w * vec4(texelFetch(tile, p, 0).r, texelFetch(tile, p + n, 0).r, texelFetch(tile, p + 2 * n, 0).r, 0.0);
+        }""",
+    "neural_cam": HALF + """
+        uniform sampler2D acc; uniform vec3 gain; uniform int flip;
+        out vec4 cam;
+        void main() {
+          ivec2 size = textureSize(acc, 0), o = ivec2(gl_FragCoord.xy);
+          int row = o.y, col = o.x;
+          if ((flip & 4) != 0) { int t = row; row = col; col = t; }
+          if ((flip & 2) != 0) row = size.y - 1 - row;
+          if ((flip & 1) != 0) col = size.x - 1 - col;
+          cam = vec4(toHalf(texelFetch(acc, ivec2(col, row), 0).rgb * gain), 0.0);
+        }""",
+    "neural_removed": """
+        uniform usampler2D raw; uniform sampler2D acc;
+        uniform float black, white; uniform vec3 gain;
+        uniform ivec4 colours; uniform vec4 weights;  // of a 2x2 tile's photosites, in denoise.PHASES order
+        out float v;
+        void main() {
+          ivec2 q = 2 * ivec2(gl_FragCoord.xy);
+          v = 0.0;
+          for (int k = 0; k < 4; k++) {
+            ivec2 p = q + ivec2(k & 1, k >> 1);
+            float x = (float(texelFetch(raw, p, 0).r) - black) / (white - black);
+            v += weights[k] * (x - gain[colours[k]] * texelFetch(acc, p, 0)[colours[k]]);
+          }
+        }""",
     "box_texture": BOX + """
         uniform sampler2D src;
         out vec4 v;
@@ -933,21 +998,68 @@ def _upload(cam) -> object:
     return _texture((w, h), 4, cam, dtype="f2")
 
 
-def _upload_decoded(cam, look, base) -> tuple:
-    """_upload(), and the look and base averaged down from it as _demosaic() does: (texture,
-    look or None, base or None)."""
-    tex = _upload(cam)
+def _neural_start(mosaic) -> dict:
+    """What neural() blends RawNIND's tiles into: a float32 texture the photo's size, in the
+    sensor's orientation, with the mosaic for what was removed (to hand back with _release)."""
+    ctx = _setup()["ctx"]
+    h, w = mosaic.shape
+    _check_size(w, h)
+    blending = {"raw": _texture((w, h), 1, mosaic, dtype="u2"), "sum": _texture((w, h), 4)}
+    blending["fb"] = ctx.framebuffer([blending["sum"]])
+    blending["fb"].clear()
+    return blending
+
+
+def _neural_blend(blending, y, x, tile, wy, wx):
+    """Add a tile of RawNIND's output (3 x th x tw), at row y, column x of the photo, times wy
+    along its rows and wx along its columns: only the part within the photo."""
+    import moderngl
+
+    ctx = _setup()["ctx"]
+    _, th, tw = tile.shape
+    fb = blending["fb"]
+    w, h = fb.size
+    planes, ty, tx = _texture((tw, 3 * th), 1, tile.reshape(3 * th, tw)), _texture((th, 1), 1, wy), _texture((tw, 1), 1, wx)
     try:
-        size = (cam.shape[1], cam.shape[0])
-        small = None if look is None else _resize("box_texture", {"src": tex}, size, look[0], look[1], 3)
-        lum = None
-        if base is not None:
-            mul, weights, base_size = base
-            lum = _resize("box_texture_luminance", {"src": tex}, size, base_size, (0, 0, *size), 1, mul=mul, weights=weights)[..., 0]
-        return tex, small, lum
+        fb.viewport = (max(x, 0), max(y, 0), min(x + tw, w) - max(x, 0), min(y + th, h) - max(y, 0))
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.ONE, moderngl.ONE
+        _pass("neural_blend", fb, {"tile": planes, "wy": ty, "wx": tx}, origin=(x, y))
+    finally:
+        ctx.disable(moderngl.BLEND)
+        fb.viewport = (0, 0, w, h)
+        _release(planes, ty, tx)
+
+
+def _neural_finish(blending, gain, black, saturation, flip, out, colours, weights, look, base) -> tuple:
+    """neural()'s camera RGB (texture), look and base (or None) and what was removed, from the
+    tiles blended."""
+    ctx = _setup()["ctx"]
+    w, h = blending["sum"].size
+    cam, removed = _texture(out, 4, dtype="f2"), _texture((w // 2, h // 2), 1)
+    fbs = [ctx.framebuffer([cam]), ctx.framebuffer([removed])]
+    try:
+        _pass("neural_cam", fbs[0], {"acc": blending["sum"]}, gain=gain, flip=flip)
+        _pass("neural_removed", fbs[1], {"raw": blending["raw"], "acc": blending["sum"]}, gain=gain, black=float(black), white=float(saturation),
+              colours=colours, weights=weights)
+        small, lum = _averages(cam, look, base)
+        return cam, small, lum, np.frombuffer(_read(removed), np.float32).reshape(h // 2, w // 2)
     except BaseException:
-        _release(tex)
+        _release(cam)
         raise
+    finally:
+        _release(removed, *fbs)
+
+
+def _averages(cam, look, base) -> tuple:
+    """The look and base averaged down from a camera RGB texture as _demosaic() does: (look or
+    None, base or None)."""
+    small = None if look is None else _resize("box_texture", {"src": cam}, cam.size, look[0], look[1], 3)
+    lum = None
+    if base is not None:
+        mul, weights, base_size = base
+        lum = _resize("box_texture_luminance", {"src": cam}, cam.size, base_size, (0, 0, *cam.size), 1, mul=mul, weights=weights)[..., 0]
+    return small, lum
 
 
 def _demosaic(mosaic, pattern, black, saturation, flip, xyz, to_cam, nlm, look, base, original) -> Decoded:

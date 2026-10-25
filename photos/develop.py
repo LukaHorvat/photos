@@ -393,18 +393,16 @@ def _neural(mosaic, pattern, black, saturation, pad, flip, cam_xyz, color, mixed
     from . import denoise as dn
     from . import gpu, neural
 
-    x = (mosaic.astype(np.float32) - black) / np.float32(saturation - black)  # in our camera RGB's units
-    rgb = neural.denoise(x, pattern)
-    removed = dn.removed(x, rgb, pattern, dn.luminance_weights(pattern, color, 1.0))
     to_cam = (saturation / 65535 / (saturation - black), pad / (saturation - black))
     original = gpu.demosaic(mosaic, pattern, black - pad, saturation, flip, cam_xyz, to_cam) if mixed else None
     try:
-        decoded = gpu.upload(dn.orient(rgb, flip), original, look=look, base=base)
+        return gpu.neural(
+            mosaic, pattern, black, saturation, flip, lambda blend: neural.denoise(mosaic, pattern, black, saturation, blend),
+            dn.luminance_weights(pattern, color, 1.0), original, look=look, base=base,
+        )
     finally:
         if original is not None:
-            original.release()  # nothing left to free once upload() took its camera RGB
-    decoded.removed = removed
-    return decoded
+            original.release()  # nothing left to free once neural() took its camera RGB
 
 
 # A photo's look is fitted from the full-size data an export develops (with noise reduction or

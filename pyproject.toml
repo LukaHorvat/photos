@@ -20,10 +20,12 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=9.1.1",
 ]
-# RawNIND noise reduction (photos/neural.py): ONNX Runtime with CUDA and cuDNN from pip, ~2.5 GB.
-# Without it (--no-group neural) the editor's Neural toggle is greyed out.
+# RawNIND noise reduction (photos/neural.py): ONNX Runtime with CUDA and cuDNN from pip, ~2.5 GB,
+# and onnx to convert the model to float16. Without it (--no-group neural) the editor's Neural
+# toggle is greyed out.
 neural = [
     "onnxruntime-gpu[cuda,cudnn]>=1.31; python_version >= '3.11' and sys_platform != 'darwin'",
+    "onnx>=1.23.2; python_version >= '3.11' and sys_platform != 'darwin'",
 ]
 
 [tool.uv]
