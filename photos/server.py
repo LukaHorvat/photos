@@ -244,7 +244,8 @@ class Library:
         return {"runs": ids, "runSettings": settings, "runEdited": [s != develop.DEFAULTS for s in settings]}
 
     def prewarm(self, workers: int = 8):
-        """Parse headers and build thumbnails in the background so the grid fills instantly."""
+        """Parse headers and build thumbnails in the background so the grid fills instantly; and
+        if any photo has RawNIND, get it ready."""
         q: queue.Queue[Photo] = queue.Queue()
         for p in self.photos.values():
             q.put(p)
@@ -262,6 +263,8 @@ class Library:
         for t in threads:
             t.start()
         threading.Thread(target=lambda: ([t.join() for t in threads], self.groups()), daemon=True).start()
+        if any(s.get("neural") for s in self.state["edits"].values()) and neural.available():
+            threading.Thread(target=neural.warm, daemon=True).start()
 
 
 class Deletion:

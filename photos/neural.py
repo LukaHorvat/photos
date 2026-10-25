@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import sys
 import threading
 import urllib.request
 import zipfile
@@ -74,6 +75,14 @@ def denoise(mosaic: np.ndarray, pattern: np.ndarray, black: float, white: float,
         return _denoise(mosaic, pattern, black, white, blend, run or _runner())
 
 
+def warm():
+    """Get RawNIND ready (CUDA, the model loaded: ~1 s), so the first photo doesn't wait for it."""
+    try:
+        _session()
+    except Exception as e:  # the photo will say what went wrong
+        print(f"  RawNIND: {e!r}", file=sys.stderr)
+
+
 def _runner():
     session = _session()
     name = session.get_inputs()[0].name
@@ -106,18 +115,20 @@ def _denoise(mosaic, pattern, black, white, blend, run):
         return (tile - np.float32(black)) / np.float32(white - black)
 
     sums = np.zeros(3)  # of the blended output over the photo
-    # The model runs on a thread of its own (ONNX Runtime lets go of the GIL), the next tile
-    # while this one is blended in
-    with ThreadPoolExecutor(1) as pool:
-        for (y, x), out in zip(tiles, pool.map(lambda t: run(planes(t)), tiles)):
+    # The model runs on a thread of its own (ONNX Runtime lets go of the GIL), its input made
+    # ready on another, while the tile before is blended in
+    with ThreadPoolExecutor(1) as inputs, ThreadPoolExecutor(1) as model:
+        outs = [model.submit(lambda i: run(i.result()), inputs.submit(planes, t)) for t in tiles]
+        # Each channel is to have the mosaic's mean of its colour
+        colours = np.where(np.asarray(pattern) == 3, 1, pattern)
+        want = [np.mean([mosaic[i::2, j::2].mean(dtype=np.float64) for i in range(2) for j in range(2) if colours[i, j] == c]) for c in range(3)]
+        for (y, x), out in zip(tiles, outs):
+            out = out.result()
             wy, wx = ramps[0] / totals[0][y : y + 2 * th], ramps[1] / totals[1][x : x + 2 * tw]
             y, x = y - top, x - left
             blend(y, x, out, wy, wx)
             rows, cols = slice(max(-y, 0), min(h - y, 2 * th)), slice(max(-x, 0), min(w - x, 2 * tw))  # within the photo
             sums += (out[:, rows, cols] @ wx[cols]) @ wy[rows]
-    # Each channel to the mosaic's mean of its colour
-    colours = np.where(np.asarray(pattern) == 3, 1, pattern)
-    want = [np.mean([mosaic[i::2, j::2].mean(dtype=np.float64) for i in range(2) for j in range(2) if colours[i, j] == c]) for c in range(3)]
     return np.float32((np.float64(want) - black) / (white - black) / (sums / (h * w)))
 
 
@@ -136,7 +147,9 @@ def _session():
     ort.preload_dlls()  # CUDA and cuDNN, from their pip packages
     options = ort.SessionOptions()
     options.log_severity_level = 3
-    providers = [("CUDAExecutionProvider", {"prefer_nhwc": "1"})]  # cuDNN's float16 convolutions are faster on channels last
+    # cuDNN's float16 convolutions are faster on channels last; its heuristic picks them as fast
+    # as trying them all does, in less time on the first tile (~0.2 s)
+    providers = [("CUDAExecutionProvider", {"prefer_nhwc": "1", "cudnn_conv_algo_search": "HEURISTIC"})]
     session = ort.InferenceSession(str(_model()), options, providers=providers)
     if session.get_providers()[0] != "CUDAExecutionProvider":  # ONNX Runtime falls back to the CPU: far too slow
         raise RuntimeError("RawNIND needs CUDA, which ONNX Runtime couldn't use")

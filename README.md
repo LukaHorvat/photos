@@ -58,11 +58,12 @@ demosaicing and denoising instead (`neural.py`): RawNIND (Brummer & De Vleeschou
 2025), the model darktable 5.6 ships as "neural restore". At high ISO its edges and
 colour come out cleaner: AHD draws mazes and combs from noisy data. The colour filter, the
 grain and the sliders still apply, up to 100% (it has no strength of its own; less mixes in
-the photo without, as above). It costs ~1.5 s more per photo and needs an NVIDIA GPU with
-CUDA, through ONNX Runtime: the `neural` dependency group (~2.5 GB, installed by default;
-`uv sync --no-group neural` leaves it out). The model (GPL-3.0, 58 MB) is downloaded from
-darktable-ai's GitHub release on first use, checked against its published SHA-256, and kept
-in `~/.cache/photos`.
+the photo without, as above). It takes about as long as non-local means (~1.5 s for a 24 Mpx
+export, on battery) and needs an NVIDIA GPU with CUDA, through ONNX Runtime: the `neural`
+dependency group (~2.5 GB, installed by default; `uv sync --no-group neural` leaves it out).
+The model (GPL-3.0) is downloaded from darktable-ai's GitHub release on first use, checked
+against its published SHA-256, converted to float16 (twice as fast; the result differs by
+~0.1%) and kept in `~/.cache/photos`.
 
 It needs to know how noisy the photo is. That's measured in the photo itself, but
 a photo full of fine texture (foliage) would read as very noisy and be smeared, so
