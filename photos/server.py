@@ -263,8 +263,9 @@ class Library:
         for t in threads:
             t.start()
         threading.Thread(target=lambda: ([t.join() for t in threads], self.groups()), daemon=True).start()
-        if any(s.get("neural") for s in self.state["edits"].values()) and neural.available():
-            threading.Thread(target=neural.warm, daemon=True).start()
+        neural_photos = [self.photos[n] for n, s in self.state["edits"].items() if s.get("neural") and n in self.photos]
+        if neural_photos and neural.available():
+            threading.Thread(target=lambda: neural.warm(neural_photos[0].size()), daemon=True).start()
 
 
 class Deletion:

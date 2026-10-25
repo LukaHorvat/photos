@@ -75,10 +75,14 @@ def denoise(mosaic: np.ndarray, pattern: np.ndarray, black: float, white: float,
         return _denoise(mosaic, pattern, black, white, blend, run or _runner())
 
 
-def warm():
-    """Get RawNIND ready (CUDA, the model loaded: ~1 s), so the first photo doesn't wait for it."""
+def warm(size: tuple[int, int] | None = None):
+    """Get RawNIND ready (CUDA, the model loaded: ~1.5 s), so the first photo doesn't wait for
+    it; with a photo's (width, height), also its tiles (cuDNN tunes for each size: ~0.7 s)."""
     try:
-        _session()
+        run = _runner()
+        if size is not None:
+            h, w = sorted(size)  # as the sensor has it, most likely
+            run(np.zeros((4, _tiling((h + 1) // 2)[0], _tiling((w + 1) // 2)[0]), np.float32))
     except Exception as e:  # the photo will say what went wrong
         print(f"  RawNIND: {e!r}", file=sys.stderr)
 
