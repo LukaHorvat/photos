@@ -53,14 +53,15 @@ slider); more smooths further (luminance at 200%: no grain at all); 0 turns it o
 Luminance 0 with colour 100% keeps all the grain but no colour noise.
 They apply when you let go of the slider, as they need the server to redo the photo.
 
-**Neural (RawNIND)**, a toggle under the sliders, has a neural network do the
-demosaicing and denoising instead (`neural.py`): RawNIND (Brummer & De Vleeschouwer,
+**Neural (RawNIND)**, a toggle under the sliders and on by default, has a neural network
+do the demosaicing and denoising instead (`neural.py`): RawNIND (Brummer & De Vleeschouwer,
 2025), the model darktable 5.6 ships as "neural restore". At high ISO its edges and
 colour come out cleaner: AHD draws mazes and combs from noisy data. The colour filter, the
 grain and the sliders still apply, up to 100% (it has no strength of its own; less mixes in
 the photo without, as above). It takes about as long as non-local means (~1.5 s for a 24 Mpx
 export, on battery) and needs an NVIDIA GPU with CUDA, through ONNX Runtime: the `neural`
-dependency group (~2.5 GB, installed by default; `uv sync --no-group neural` leaves it out).
+dependency group (~2.5 GB, installed by default; `uv sync --no-group neural` leaves it out;
+without it, or without CUDA, non-local means does the noise reduction).
 The model (GPL-3.0) is downloaded from darktable-ai's GitHub release on first use, checked
 against its published SHA-256, converted to float16 (twice as fast; the result differs by
 ~0.1%) and kept in `~/.cache/photos`.
@@ -95,7 +96,7 @@ Everything is saved as you go to `<folder>/.photos.json`:
 ```json
 {
   "marks": {"DSC_9282.NEF": "keep", "DSC_9283.NEF": "reject"},
-  "edits": {"DSC_9290.NEF": {"compress": 40, "exposure": 0.3, "temp": null, "saturation": 10, "contrast": 0, "noise": null, "chroma": null, "neural": false}},
+  "edits": {"DSC_9290.NEF": {"compress": 40, "exposure": 0.3, "temp": null, "saturation": 10, "contrast": 0, "noise": null, "chroma": null, "neural": true}},
   "version": 1
 }
 ```

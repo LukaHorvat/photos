@@ -34,8 +34,9 @@ from .look import GRID, LUMA, Look, jpeg_target, load_profile, samples_at
 
 # temp None: as shot. tint 0: the camera's. noise, chroma: luminance and colour noise reduction,
 # None automatic (denoise.strength), else the strength in percent: 0 off, 100 standard, up to 200.
-# neural: by RawNIND (neural.py) instead of non-local means, which caps both at 100.
-DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "tint": 0, "saturation": 0, "contrast": 0, "noise": None, "chroma": None, "neural": False}
+# neural: by RawNIND (neural.py) instead of non-local means, which caps both at 100; the default,
+# though without CUDA non-local means still does it (reduction()).
+DEFAULTS = {"compress": 0, "exposure": 0.0, "temp": None, "tint": 0, "saturation": 0, "contrast": 0, "noise": None, "chroma": None, "neural": True}
 LIMITS = {
     "compress": (0, 100),
     "exposure": (-4.0, 4.0),

@@ -104,7 +104,7 @@ def test_gpu_blends_as_the_cpu_does(gpu, flip, small_tiles):
 def test_neural_caps_the_strengths_and_needs_cuda(monkeypatch):
     s = develop.clean({"noise": 150, "chroma": None, "neural": 1})
     assert s["neural"] is True and s["noise"] == 100 and s["chroma"] is None
-    assert develop.clean({"noise": 150})["noise"] == 150 and develop.clean({})["neural"] is False
+    assert develop.clean({"noise": 150, "neural": False})["noise"] == 150 and develop.clean({})["neural"] is True
     monkeypatch.setattr(neural, "available", lambda: True)
     assert develop.reduction(s, 25600) == denoise.Reduction(1, 1, True)
     monkeypatch.setattr(neural, "available", lambda: False)  # non-local means instead

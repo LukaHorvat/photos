@@ -144,8 +144,8 @@ def test_automatic_noise_reduction_follows_iso():
 
 def test_noise_setting_is_automatic_unless_set():
     assert develop.clean({})["noise"] is None and develop.clean({"noise": None})["noise"] is None
-    assert develop.clean({"noise": 100})["noise"] == 100 and develop.clean({"noise": 250})["noise"] == 200
-    assert develop.reduction(develop.clean({"noise": 0, "chroma": None}), 25600) == denoise.Reduction(0, 1)  # luminance off, colour auto
+    assert develop.clean({"noise": 100})["noise"] == 100 and develop.clean({"noise": 250, "neural": False})["noise"] == 200
+    assert develop.reduction(develop.clean({"noise": 0, "chroma": None, "neural": False}), 25600) == denoise.Reduction(0, 1)  # luminance off, colour auto
     assert develop.clean({"noise": 60})["chroma"] == 60  # saved when one setting did both
     assert develop.clean({"noise": 60, "chroma": None})["chroma"] is None
 

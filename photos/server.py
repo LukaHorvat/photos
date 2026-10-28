@@ -245,7 +245,7 @@ class Library:
 
     def prewarm(self, workers: int = 8):
         """Parse headers and build thumbnails in the background so the grid fills instantly; and
-        if any photo has RawNIND, get it ready."""
+        if there are raws, get RawNIND (their default) ready."""
         q: queue.Queue[Photo] = queue.Queue()
         for p in self.photos.values():
             q.put(p)
@@ -263,9 +263,9 @@ class Library:
         for t in threads:
             t.start()
         threading.Thread(target=lambda: ([t.join() for t in threads], self.groups()), daemon=True).start()
-        neural_photos = [self.photos[n] for n, s in self.state["edits"].items() if s.get("neural") and n in self.photos]
-        if neural_photos and neural.available():
-            threading.Thread(target=lambda: neural.warm(neural_photos[0].size()), daemon=True).start()
+        raws = [p for p in self.photos.values() if p.is_raw]
+        if raws and neural.available():
+            threading.Thread(target=lambda: neural.warm(raws[0].size()), daemon=True).start()
 
 
 class Deletion:
